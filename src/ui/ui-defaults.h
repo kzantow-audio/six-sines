@@ -23,25 +23,62 @@ namespace baconpaul::six_sines::ui
 {
 enum Defaults
 {
-    useLightSkin,
+    themePath, // stored as "factory:<Name>" for factory themes, or a filesystem path for user
+               // themes
     zoomLevel,
     useSoftwareRenderer, // only used on windows
     flipSourceAndMatrix,
+    designModeRunAllNodes,
+    designModeAllSoundsOffOnToggle,
+    defaultAuthor,
+    spectrumAnalysisMode,
+    spectrumScopeScale,
+    sourceEditorType,
+    defaultMPEBend,         // int semitones; seeds DawExtraState.mpeBendRange on engine init
+    defaultMIDISmoothing,   // ms, stored as string; seeds midiCCSmoothingTimeMs
+    defaultParamSmoothing,  // ms, stored as string; seeds paramAutomationSmoothingTimeMs
+    lastWavetableDirectory, // u8 path; where the wavetable chooser opens next
     numDefaults
+};
+
+enum SourceEditorType : int
+{
+    SourceEditor_Knob = 0,
+    SourceEditor_SegmentedDecimal = 1
 };
 
 inline std::string defaultName(Defaults d)
 {
     switch (d)
     {
-    case useLightSkin:
-        return "useLightSkin";
+    case themePath:
+        return "themePath";
     case zoomLevel:
         return "zoomLevel";
     case useSoftwareRenderer:
         return "useSoftwareRenderer";
     case flipSourceAndMatrix:
         return "flipSourceAndMatrix";
+    case designModeRunAllNodes:
+        return "designModeRunAllNodes";
+    case designModeAllSoundsOffOnToggle:
+        return "designModeAllSoundsOffOnToggle";
+    case defaultAuthor:
+        return "defaultAuthor";
+    case spectrumAnalysisMode:
+        return "spectrumAnalysisMode";
+    case spectrumScopeScale:
+        return "spectrumScopeScale";
+    case sourceEditorType:
+        return "sourceEditorType";
+    case defaultMPEBend:
+        return "defaultMPEBend";
+    case defaultMIDISmoothing:
+        return "defaultMIDISmoothing";
+    case defaultParamSmoothing:
+        return "defaultParamSmoothing";
+    case lastWavetableDirectory:
+        return "lastWavetableDirectory";
     case numDefaults:
     {
         SXSNLOG("Software Error - defaults found");

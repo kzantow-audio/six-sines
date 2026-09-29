@@ -39,6 +39,11 @@ struct Clipboard
         FEEDBACK_FULLNODE
     } clipboardType{NONE};
 
+    // Source nodes only: which of the patch's wavetable blobs the copied operator used. The
+    // editor idle reconciles, so a paste takes effect on the next tick without the clipboard
+    // needing to know how tables are built.
+    int wavetableBlobIndex{-1};
+
     void doCopyFrom(const std::vector<Param *> &pars, ClipboardType type)
     {
         clipboard.clear();
@@ -143,12 +148,22 @@ struct Clipboard
     template <typename Node> void copyFullNodeFrom(Node &n, ClipboardType type)
     {
         doCopyFrom(n.params(), type);
+        // A source node's wavetable is not a Param, so copying the params alone would leave the
+        // target in USER_TABLE mode with nothing to read. The blob is already shared within the
+        // patch, so carrying the index is all it takes.
+        if constexpr (requires { n.wavetableBlobIndex; })
+            wavetableBlobIndex = n.wavetableBlobIndex;
     }
 
     template <typename Node>
     void pasteFullNodeTo(SixSinesEditor &e, Node &n, ClipboardType type) const
     {
         doPasteTo(e, n.params(), type);
+        if constexpr (requires { n.wavetableBlobIndex; })
+        {
+            if (clipboardType == type)
+                n.wavetableBlobIndex = wavetableBlobIndex;
+        }
     }
 
     template <typename Node> void resetFullNodeHelper(SixSinesEditor &e, Node &n) const
@@ -203,51 +218,51 @@ struct SupportsClipboard
     bool supportsFullNode() const override;
 
 #define IMPLEMENTS_CLIPBOARD_SUPPORT(CN, NODE, CLIPBOARD_TYPE)                                     \
-    void CN::copyEnvelopeTo(Clipboard &c) { c.copyEnvelopeFrom(editor.patchCopy.NODE); }           \
+    void CN::copyEnvelopeTo(Clipboard &c) { c.copyEnvelopeFrom(editor.patchMainRef.NODE); }           \
     void CN::pasteEnvelopeFrom(const Clipboard &c)                                                 \
     {                                                                                              \
-        c.pasteEnvelopeTo(editor, editor.patchCopy.NODE);                                          \
+        c.pasteEnvelopeTo(editor, editor.patchMainRef.NODE);                                          \
         repaint();                                                                                 \
     }                                                                                              \
     void CN::resetEnvelope(const Clipboard &c)                                                     \
     {                                                                                              \
-        c.resetEnvelopeHelper(editor, editor.patchCopy.NODE);                                      \
+        c.resetEnvelopeHelper(editor, editor.patchMainRef.NODE);                                      \
         repaint();                                                                                 \
     }                                                                                              \
-    void CN::copyLFOTo(Clipboard &c) { c.copyLFOFrom(editor.patchCopy.NODE); }                     \
+    void CN::copyLFOTo(Clipboard &c) { c.copyLFOFrom(editor.patchMainRef.NODE); }                     \
     void CN::pasteLFOFrom(const Clipboard &c)                                                      \
     {                                                                                              \
-        c.pasteLFOTo(editor, editor.patchCopy.NODE);                                               \
+        c.pasteLFOTo(editor, editor.patchMainRef.NODE);                                               \
         repaint();                                                                                 \
     }                                                                                              \
     void CN::resetLFO(const Clipboard &c)                                                          \
     {                                                                                              \
-        c.resetLFOHelper(editor, editor.patchCopy.NODE);                                           \
+        c.resetLFOHelper(editor, editor.patchMainRef.NODE);                                           \
         repaint();                                                                                 \
     }                                                                                              \
-    void CN::copyModulationTo(Clipboard &c) { c.copyModulationFrom(editor.patchCopy.NODE); }       \
+    void CN::copyModulationTo(Clipboard &c) { c.copyModulationFrom(editor.patchMainRef.NODE); }       \
     void CN::pasteModulationFrom(const Clipboard &c)                                               \
     {                                                                                              \
-        c.pasteModulationTo(editor, editor.patchCopy.NODE);                                        \
+        c.pasteModulationTo(editor, editor.patchMainRef.NODE);                                        \
         repaint();                                                                                 \
     }                                                                                              \
     void CN::resetModulation(const Clipboard &c)                                                   \
     {                                                                                              \
-        c.resetModulationHelper(editor, editor.patchCopy.NODE);                                    \
+        c.resetModulationHelper(editor, editor.patchMainRef.NODE);                                    \
         repaint();                                                                                 \
     }                                                                                              \
     void CN::copyFullNodeTo(Clipboard &c)                                                          \
     {                                                                                              \
-        c.copyFullNodeFrom(editor.patchCopy.NODE, CLIPBOARD_TYPE);                                 \
+        c.copyFullNodeFrom(editor.patchMainRef.NODE, CLIPBOARD_TYPE);                                 \
     }                                                                                              \
     void CN::pasteFullNodeFrom(const Clipboard &c)                                                 \
     {                                                                                              \
-        c.pasteFullNodeTo(editor, editor.patchCopy.NODE, CLIPBOARD_TYPE);                          \
+        c.pasteFullNodeTo(editor, editor.patchMainRef.NODE, CLIPBOARD_TYPE);                          \
         repaint();                                                                                 \
     }                                                                                              \
     void CN::resetFullNode(const Clipboard &c)                                                     \
     {                                                                                              \
-        c.resetFullNodeHelper(editor, editor.patchCopy.NODE);                                      \
+        c.resetFullNodeHelper(editor, editor.patchMainRef.NODE);                                      \
         repaint();                                                                                 \
     }                                                                                              \
     Clipboard::ClipboardType CN::getFullNodeType() const { return CLIPBOARD_TYPE; }                \

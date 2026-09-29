@@ -24,8 +24,10 @@
 
 #include "sst/jucegui/components/Knob.h"
 #include "sst/jucegui/components/DraggableTextEditableValue.h"
+#include "sst/jucegui/components/JogUpDownButton.h"
 
 #include "six-sines-editor.h"
+#include "six-sines-editor-impl.h"
 
 namespace baconpaul::six_sines::ui
 {
@@ -38,7 +40,7 @@ struct PatchContinuous : jdat::Continuous
 
     PatchContinuous(SixSinesEditor &e, uint32_t id) : editor(e), pid(id)
     {
-        if (e.patchCopy.paramMap.find(id) == e.patchCopy.paramMap.end())
+        if (e.patchMainRef.paramMap.find(id) == e.patchMainRef.paramMap.end())
         {
             SXSNLOG("You were unable to find param " << id
                                                      << " - its probably not in patch::params()");
@@ -46,7 +48,7 @@ struct PatchContinuous : jdat::Continuous
             std::terminate();
         }
 
-        p = e.patchCopy.paramMap.at(id);
+        p = e.patchMainRef.paramMap.at(id);
     }
     ~PatchContinuous() override = default;
 
@@ -106,6 +108,7 @@ struct PatchContinuous : jdat::Continuous
                 onPullFromDef();
         }
         p->value = f;
+        editor.markPatchDirty();
         editor.mainToAudio.push({Synth::MainToAudioMsg::Action::SET_PARAM, pid, f});
         editor.requestParamsFlush();
         editor.updateTooltip(this);
@@ -136,14 +139,14 @@ struct PatchDiscrete : jdat::Discrete
 
     PatchDiscrete(SixSinesEditor &e, uint32_t id) : editor(e), pid(id)
     {
-        if (e.patchCopy.paramMap.find(id) == e.patchCopy.paramMap.end())
+        if (e.patchMainRef.paramMap.find(id) == e.patchMainRef.paramMap.end())
         {
             SXSNLOG("You were unable to find param " << id
                                                      << " - its probably not in patch::params()");
             assert(false);
             std::terminate();
         }
-        p = e.patchCopy.paramMap.at(id);
+        p = e.patchMainRef.paramMap.at(id);
     }
     ~PatchDiscrete() override = default;
 
@@ -163,6 +166,7 @@ struct PatchDiscrete : jdat::Discrete
     void setValueFromGUI(const int &f) override
     {
         p->value = f;
+        editor.markPatchDirty();
         editor.mainToAudio.push(
             {Synth::MainToAudioMsg::Action::SET_PARAM, pid, static_cast<float>(f)});
         editor.requestParamsFlush();
@@ -179,6 +183,22 @@ struct PatchDiscrete : jdat::Discrete
     int getMax() const override { return static_cast<int>(std::round(p->meta.maxVal)); }
 };
 
+/*
+ * Gates the tooltip show/hide/update plumbing inside createComponent / createRescaledComponent.
+ *
+ * Default is false — tooltips are wired up on begin/end edit, idle hover, and popup menu.
+ *
+ * To suppress tooltips for a particular widget type, specialize by widget only:
+ *   template <> constexpr bool suppressTooltipByWidget<MyWidget>() { return true; }
+ * This catches every source binding of that widget (PatchContinuous, PatchDiscrete, and any
+ * subclass such as WaveformPatchDiscrete), so you don't need one spec per source type.
+ */
+template <typename Q> constexpr bool suppressTooltipByWidget() { return false; }
+
+// JogUpDown buttons already display the current value in the button label, so a tooltip is
+// redundant and distracting.
+template <> constexpr bool suppressTooltipByWidget<jcmp::JogUpDownButton>() { return true; }
+
 template <typename P, typename T, typename Q, typename... Args>
 void createComponent(SixSinesEditor &e, P &panel, const Param &parm, std::unique_ptr<T> &cm,
                      std::unique_ptr<Q> &pc, Args... args)
@@ -192,14 +212,15 @@ void createComponent(SixSinesEditor &e, P &panel, const Param &parm, std::unique
     {
         cm->onPopupMenu = [&e, ptr = cm.get()](auto &mods)
         {
-            e.hideTooltip();
+            if constexpr (!suppressTooltipByWidget<T>())
+                e.hideTooltip();
             e.popupMenuForContinuous(ptr);
         };
     }
     cm->onBeginEdit = [&e, &cm, &pc, args..., id, &panel]()
     {
         e.mainToAudio.push({Synth::MainToAudioMsg::Action::BEGIN_EDIT, id});
-        if (std::is_same_v<Q, PatchContinuous>)
+        if constexpr (!suppressTooltipByWidget<T>())
         {
             e.updateTooltip(pc.get());
             e.showTooltipOn(cm.get());
@@ -207,12 +228,16 @@ void createComponent(SixSinesEditor &e, P &panel, const Param &parm, std::unique
 
         panel.beginEdit(args...);
     };
-    cm->onEndEdit = [&e, id, &panel]()
+    cm->onEndEdit = [&e, id, &pc]()
     {
         e.mainToAudio.push({Synth::MainToAudioMsg::Action::END_EDIT, id});
-        if (std::is_same_v<Q, PatchContinuous>)
+        if constexpr (!suppressTooltipByWidget<T>())
         {
-            e.hideTooltip();
+            e.updateTooltip(pc.get());
+            if (std::is_same_v<Q, PatchContinuous>)
+            {
+                e.hideTooltip();
+            }
         }
     };
     cm->onWheelEditOccurred = [&cm]()
@@ -225,10 +250,17 @@ void createComponent(SixSinesEditor &e, P &panel, const Param &parm, std::unique
 
     cm->onIdleHover = [&e, &cm, &pc]()
     {
-        e.updateTooltip(pc.get());
-        e.showTooltipOn(cm.get());
+        if constexpr (!suppressTooltipByWidget<T>())
+        {
+            e.updateTooltip(pc.get());
+            e.showTooltipOn(cm.get());
+        }
     };
-    cm->onIdleHoverEnd = [&e]() { e.hideTooltip(); };
+    cm->onIdleHoverEnd = [&e]()
+    {
+        if constexpr (!suppressTooltipByWidget<T>())
+            e.hideTooltip();
+    };
 
     cm->setSource(pc.get());
     sst::jucegui::component_adapters::setClapParamId(cm.get(), id);
@@ -249,29 +281,41 @@ void createRescaledComponent(SixSinesEditor &e, P &panel, const Param &parm, std
     {
         cm->onPopupMenu = [&e, ptr = cm.get()](auto &mods)
         {
-            e.hideTooltip();
+            if constexpr (!suppressTooltipByWidget<T>())
+                e.hideTooltip();
             e.popupMenuForContinuous(ptr);
         };
     }
     cm->onBeginEdit = [&e, &cm, &rc, args..., id, &panel]()
     {
         e.mainToAudio.push({Synth::MainToAudioMsg::Action::BEGIN_EDIT, id});
-        e.updateTooltip(rc.get());
-        e.showTooltipOn(cm.get());
+        if constexpr (!suppressTooltipByWidget<T>())
+        {
+            e.updateTooltip(rc.get());
+            e.showTooltipOn(cm.get());
+        }
 
         panel.beginEdit(args...);
     };
     cm->onEndEdit = [&e, id, &panel]()
     {
         e.mainToAudio.push({Synth::MainToAudioMsg::Action::END_EDIT, id});
-        e.hideTooltip();
+        if constexpr (!suppressTooltipByWidget<T>())
+            e.hideTooltip();
     };
     cm->onIdleHover = [&e, &cm, &rc]()
     {
-        e.updateTooltip(rc.get());
-        e.showTooltipOn(cm.get());
+        if constexpr (!suppressTooltipByWidget<T>())
+        {
+            e.updateTooltip(rc.get());
+            e.showTooltipOn(cm.get());
+        }
     };
-    cm->onIdleHoverEnd = [&e]() { e.hideTooltip(); };
+    cm->onIdleHoverEnd = [&e]()
+    {
+        if constexpr (!suppressTooltipByWidget<T>())
+            e.hideTooltip();
+    };
     cm->setSource(rc.get());
     sst::jucegui::component_adapters::setClapParamId(cm.get(), id);
 

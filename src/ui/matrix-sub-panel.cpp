@@ -26,7 +26,7 @@ void MatrixSubPanel::setSelectedIndex(int idx)
 
     removeAllChildren();
 
-    auto &m = editor.patchCopy.matrixNodes[idx];
+    auto &m = editor.patchMainRef.matrixNodes[idx];
     setupDAHDSR(editor, m);
     setupLFO(editor, m);
     setupModulation(editor, m);
@@ -52,6 +52,10 @@ void MatrixSubPanel::setSelectedIndex(int idx)
     createComponent(editor, *this, m.envIsMultiplcative, envMul, envMulD);
     addAndMakeVisible(*envMul);
     traverse(envMul);
+
+    createComponent(editor, *this, m.lfoDepthMode, lfoMode, lfoModeD);
+    addAndMakeVisible(*lfoMode);
+    traverse(lfoMode);
 
     modLabelE = std::make_unique<jcmp::RuledLabel>();
     modLabelE->setText(std::string() + "Env" + u8"\U00002192");
@@ -91,8 +95,8 @@ void MatrixSubPanel::resized()
     pn = pn.translated(uicMargin, 0);
     auto r = layoutLFOAt(pn.getX(), p.getY());
 
-    auto depx = r.getX() + uicMargin;
-    auto depy = r.getY();
+    auto depx = p.getX();
+    auto depy = std::min(pn.getBottom(), r.getBottom()) + uicMargin;
 
     namespace jlo = sst::jucegui::layouts;
     auto lo = jlo::HList().at(depx, depy).withAutoGap(uicMargin * 2);
@@ -106,6 +110,11 @@ void MatrixSubPanel::resized()
     auto ll = jlo::VList().withWidth(uicSubPanelColumnWidth).withAutoGap(uicMargin);
     ll.add(titleLabelGaplessLayout(modLabelL));
     ll.add(labelKnobLayout(lfoToDepth, lfoToDepthL).centerInParent());
+
+    auto sl = jlo::HList().withHeight(3 * uicLabelHeight + uicMargin).withAutoGap(uicMargin);
+    sl.add(jlo::Component(*lfoMode).withWidth(uicSubPanelColumnWidth));
+    ll.add(sl);
+
     lo.add(ll);
 
     auto od = jlo::VList().withWidth(uicSubPanelColumnWidth).withAutoGap(uicMargin);

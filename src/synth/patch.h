@@ -20,6 +20,8 @@
 #include <array>
 #include <unordered_map>
 #include <algorithm>
+#include <string>
+#include <cstring>
 #include <clap/clap.h>
 #include "configuration.h"
 #include "sst/cpputils/constructors.h"
@@ -29,13 +31,20 @@
 #include "sst/basic-blocks/modulators/DAHDSREnvelope.h"
 #include "sst/plugininfra/patch-support/patch_base.h"
 #include "synth/matrix_index.h"
+#include <memory>
+
 #include "dsp/sintable.h"
+#include "dsp/wavetable.h"
+#include "filesystem/import.h"
 
 namespace baconpaul::six_sines
 {
 namespace scpu = sst::cpputils;
 namespace pats = sst::plugininfra::patch_support;
 using md_t = sst::basic_blocks::params::ParamMetaData;
+
+static constexpr uint64_t isPrimaryMacroFeature = (uint64_t)md_t::Features::USER_FEATURE_0;
+
 struct Param : pats::ParamBase, sst::cpputils::active_set_overlay<Param>::participant
 {
     Param(const md_t &m) : pats::ParamBase(m) {}
@@ -70,19 +79,52 @@ struct Param : pats::ParamBase, sst::cpputils::active_set_overlay<Param>::partic
 
 struct Patch : pats::PatchBase<Patch, Param>
 {
-    static constexpr uint32_t patchVersion{9};
+    static constexpr uint32_t patchVersion{14};
     static constexpr const char *id{"org.baconpaul.six-sines"};
 
     static constexpr uint32_t floatFlags{CLAP_PARAM_IS_AUTOMATABLE};
     static constexpr uint32_t boolFlags{CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_STEPPED};
 
-    static md_t floatMd() { return md_t().asFloat().withFlags(floatFlags); }
-    static md_t floatEnvRateMd()
+    static constexpr uint64_t version_110 = 0x010100;
+    // first chunk of 1.2.0; step sequencer
+    static constexpr uint64_t version_120a = 0x010201;
+    // second chunk of 1.2.0; extended mode for source
+    static constexpr uint64_t version_120b = 0x010202;
+    // third chunk of 1.2.0: super macros
+    static constexpr uint64_t version_120c = 0x010203;
+    // Fourth chunk of 1.2.0: resonant sweeps
+    static constexpr uint64_t version_120d = 0x010204;
+    // Fifth chunk of 1.2.0: output signal-path stages
+    static constexpr uint64_t version_120e = 0x010205;
+    // Sixth chunk of 1.2.0: pink-noise extended mode
+    static constexpr uint64_t version_120f = 0x010206;
+    // Seventh chunk of 1.2.0: LFO song-position run mode
+    static constexpr uint64_t version_120g = 0x010207;
+    static constexpr uint64_t version_120h = 0x010208;
+    // first chunk of 1.3.0: phase-map read-phase offset
+    static constexpr uint64_t version_130a = 0x010301;
+    // user wavetables: morph and its env / lfo depths
+    static constexpr uint64_t version_130b = 0x010302;
+    // 1.2 dsp fixes (output bus, table slopes, ring mod dc block); the legacy flag keeps 1.2's
+    static constexpr uint64_t version_130c = 0x010303;
+
+    static md_t baseMd(uint64_t version = version_110) { return md_t().withVersion(version); }
+    static md_t floatMd(uint64_t version = version_110)
     {
-        return md_t().asFloat().withFlags(floatFlags).as25SecondExpTime();
+        return baseMd(version).asFloat().withFlags(floatFlags);
     }
-    static md_t boolMd() { return md_t().asBool().withFlags(boolFlags); }
-    static md_t intMd() { return md_t().asInt().withFlags(boolFlags); }
+    static md_t floatEnvRateMd(uint64_t version = version_110)
+    {
+        return baseMd(version).asFloat().withFlags(floatFlags).as25SecondTemposyncableExpTime();
+    }
+    static md_t boolMd(uint64_t version = version_110)
+    {
+        return baseMd(version).asBool().withOnOffFormatting().withFlags(boolFlags);
+    }
+    static md_t intMd(uint64_t version = version_110)
+    {
+        return baseMd(version).asInt().withFlags(boolFlags);
+    }
 
     Patch()
         : pats::PatchBase<Patch, Param>(),
@@ -94,6 +136,12 @@ struct Patch : pats::PatchBase<Patch, Param>
           mainPanMod()
     {
         MatrixIndex::initialize();
+        for (int i = 0; i < numMacros; ++i)
+        {
+            auto s = "Macro " + std::to_string(i + 1);
+            strncpy(macroNames[i].data(), s.c_str(), 63);
+            macroNames[i][63] = '\0';
+        }
         auto pushParams = [this](auto &from) { this->pushMultipleParams(from.params()); };
 
         pushParams(output);
@@ -138,27 +186,51 @@ struct Patch : pats::PatchBase<Patch, Param>
 
                       return a->meta.name < b->meta.name;
                   });
+
+        setupAdditionalState();
     }
+
+    void setupAdditionalState();
 
     struct LFOMixin
     {
-        LFOMixin(const std::string name, int id0)
-            : lfoRate(floatMd()
+        enum Shape
+        {
+            Sine = 0,
+            Ramp,
+            Saw,
+            Triangle,
+            Pulse,
+            Noise,
+            SandH,
+            Step
+        };
+
+        enum LfoRunMode
+        {
+            VOICE_TRIGGER = 0,
+            SONGPOS,
+            RANDOM_PHASE,
+            RANDOM_PHASE_UNISON
+        };
+
+        LFOMixin(const std::string name, int id0, int stepid0 = -1, uint64_t version = version_110)
+            : lfoRate(floatMd(version)
                           .asLfoRate(-7, 11)
                           .withName(name + " LFO Rate")
                           .withGroupName(name)
                           .withDefault(0)
                           .withID(id0 + 1)),
-              lfoDeform(floatMd()
+              lfoDeform(floatMd(version)
                             .asPercentBipolar()
                             .withName(name + " LFO Deform")
                             .withGroupName(name)
                             .withDefault(0)
                             .withID(id0 + 2)),
-              lfoShape(intMd()
+              lfoShape(intMd(version)
                            .withName(name + " LFO Shape")
                            .withGroupName(name)
-                           .withRange(0, 6)
+                           .withRange(0, 7)
                            .withDefault(0)
                            .withID(id0 + 3)
                            .withUnorderedMapFormatting({{0, "Sine"},
@@ -167,41 +239,77 @@ struct Patch : pats::PatchBase<Patch, Param>
                                                         {3, "Triangle"},
                                                         {4, "Pulse"},
                                                         {5, "Noise"},
-                                                        {6, "S and H"}})),
-              lfoActive(boolMd()
+                                                        {6, "S and H"},
+                                                        {7, "Step"}})),
+              lfoActive(boolMd(version)
                             .withDefault(true)
                             .withID(id0 + 4)
                             .withName(name + " LFO Active")
                             .withGroupName(name)),
-              tempoSync(md_t() // non-automatable
-                            .asBool()
+              tempoSync(baseMd(version) // non-automatable
+                            .asOnOffBool()
                             .withID(id0 + 5)
                             .withName(name + " Temposync")
                             .withGroupName(name)
                             .withDefault(false)),
-              lfoBipolar(boolMd()
+              lfoBipolar(boolMd(version)
                              .withDefault(true)
                              .withID(id0 + 6)
                              .withName(name + " Bipolar")
                              .withGroupName(name)),
-              lfoIsEnveloped(boolMd()
+              lfoIsEnveloped(boolMd(version)
                                  .withDefault(false)
                                  .withID(id0 + 7)
                                  .withName(name + " Is Enveloped")
                                  .withGroupName(name)),
-              lfoStartPhase(floatMd()
+              lfoStartPhase(floatMd(version)
                                 .withDefault(0)
                                 .withID(id0 + 8)
                                 .withName(name + " Start Phase")
                                 .withGroupName(name)
                                 .withRange(0., 1.)
-                                .withLinearScaleFormatting(""))
+                                .withLinearScaleFormatting("")),
+              lfoSeqSteps(scpu::make_array_lambda<Param, numSeqSteps>(
+                  [this, id0, stepid0, name](auto sid)
+                  {
+                      auto idv = (stepid0 > 0 ? (stepid0) : (id0 + 9)) + sid;
+                      return floatMd(version_120a)
+                          .withDefault(0)
+                          .withID(idv)
+                          .withName(name + " Seq Step " + std::to_string(sid))
+                          .withGroupName(name)
+                          .asPercentBipolar();
+                  })),
+              lfoStepCount(intMd(version_120a)
+                               .withID((stepid0 > 0 ? (stepid0) : (id0 + 9)) + 16)
+                               .withName(name + " Step Count")
+                               .withGroupName(name)
+                               .withRange(1, numSeqSteps)
+                               .withDefault(numSeqSteps)
+                               .withLinearScaleFormatting("steps")),
+              lfoCycleMode(boolMd(version_120a)
+                               .withName(name + " Cycle")
+                               .withDefault(0)
+                               .withGroupName(name)
+                               .withID(((stepid0 > 0 ? (stepid0) : (id0 + 9)) + 17))),
+              runMode(intMd(version_120g)
+                          .withName(name + " LFO Run Mode")
+                          .withGroupName(name)
+                          .withGroupName(name)
+                          .withRange(LfoRunMode::VOICE_TRIGGER, LfoRunMode::RANDOM_PHASE_UNISON)
+                          .withDefault(LfoRunMode::VOICE_TRIGGER)
+                          .withID(stepid0 > 0 ? (id0 + 9) : (id0 + 27))
+                          .withUnorderedMapFormatting({{LfoRunMode::VOICE_TRIGGER, "Retrig"},
+                                                       {LfoRunMode::SONGPOS, "Song"},
+                                                       {LfoRunMode::RANDOM_PHASE, "RndVc"},
+                                                       {LfoRunMode::RANDOM_PHASE_UNISON, "RndNt"}}))
         {
             lfoRate.tempoSyncPartner = &tempoSync;
         }
 
         Param lfoRate, lfoDeform, lfoShape, lfoActive, tempoSync, lfoBipolar, lfoIsEnveloped,
-            lfoStartPhase;
+            lfoStartPhase, lfoStepCount, lfoCycleMode, runMode;
+        std::array<Param, numSeqSteps> lfoSeqSteps;
 
         void appendLFOParams(std::vector<Param *> &res)
         {
@@ -212,6 +320,13 @@ struct Patch : pats::PatchBase<Patch, Param>
             res.push_back(&lfoBipolar);
             res.push_back(&lfoIsEnveloped);
             res.push_back(&lfoStartPhase);
+            for (size_t sid = 0; sid < numSeqSteps; ++sid)
+            {
+                res.push_back(&lfoSeqSteps[sid]);
+            }
+            res.push_back(&lfoStepCount);
+            res.push_back(&lfoCycleMode);
+            res.push_back(&runMode);
         }
 
         enum LFOTargets
@@ -234,62 +349,62 @@ struct Patch : pats::PatchBase<Patch, Param>
     {
 
         DAHDSRMixin(const std::string name, int id0, bool longAdsr, bool alwaysAdd = false,
-                    int id1 = -1)
-            : delay(floatEnvRateMd()
+                    int id1 = -1, uint64_t version = version_110)
+            : delay(floatEnvRateMd(version)
                         .withName(name + " Env Delay")
                         .withGroupName(name)
                         .withDefault(0.f)
                         .withID(id0 + 0)),
-              attack(floatEnvRateMd()
+              attack(floatEnvRateMd(version)
                          .withName(name + " Env Attack")
                          .withGroupName(name)
                          .withDefault(longAdsr ? 0.05 : 0.f)
                          .withID(id0 + 1)),
-              hold(floatEnvRateMd()
+              hold(floatEnvRateMd(version)
                        .withName(name + " Env Hold")
                        .withGroupName(name)
                        .withDefault(0.f)
                        .withID(id0 + 2)),
-              decay(floatEnvRateMd()
+              decay(floatEnvRateMd(version)
                         .withName(name + " Env Decay")
                         .withGroupName(name)
                         .withDefault(longAdsr ? 0.3 : 0.f)
                         .withID(id0 + 3)),
-              sustain(floatMd()
+              sustain(floatMd(version)
                           .asPercent()
                           .withName(name + " Env Sustain")
                           .withGroupName(name)
                           .withDefault(longAdsr ? 0.7f : 1.f)
                           .withID(id0 + 4)),
-              release(floatEnvRateMd()
+              release(floatEnvRateMd(version)
                           .withName(name + " Env Release")
                           .withGroupName(name)
                           .withDefault(longAdsr ? 0.4 : 1.f)
                           .withID(id0 + 5)),
-              envPower(boolMd()
+              envPower(boolMd(version)
                            .withName(name + " Env Power")
                            .withGroupName(name)
                            .withDefault(true)
                            .withID(id0 + 6)),
-              aShape(floatMd()
+              aShape(floatMd(version)
                          .asPercentBipolar()
                          .withName(name + " Attack Shape")
                          .withGroupName(name)
                          .withDefault(0)
                          .withID(id0 + 7)),
-              dShape(floatMd()
+              dShape(floatMd(version)
                          .asPercentBipolar()
                          .withName(name + " Decay Shape")
                          .withGroupName(name)
                          .withDefault(0)
                          .withID(id0 + 8)),
-              rShape(floatMd()
+              rShape(floatMd(version)
                          .asPercentBipolar()
                          .withName(name + " Release Shape")
                          .withGroupName(name)
                          .withDefault(0)
                          .withID(id0 + 9)),
-              triggerMode(intMd()
+              triggerMode(intMd(version)
                               .withRange(0, 3)
                               .withName(name + " Env Trigger Mode")
                               .withGroupName(name)
@@ -299,22 +414,28 @@ struct Patch : pats::PatchBase<Patch, Param>
                                                            {1, "Voice Start"},
                                                            {3, "Key Press"},
                                                            {2, "Patch Default"}})),
-              envIsMultiplcative(boolMd()
+              envIsMultiplcative(boolMd(version)
                                      .withName(name + " Env is Multiplicative")
                                      .withGroupName(name)
                                      .withDefault(!alwaysAdd)
                                      .withID(id0 + 11)
                                      .withUnorderedMapFormatting({{0, "Add"}, {1, "Scale"}})),
-              envIsOneShot(boolMd()
+              envIsOneShot(boolMd(version)
                                .withName(name + " Is OneShot")
                                .withGroupName(name)
                                .withDefault(false)
                                .withID(id0 + 12)),
-              envTriggersFromZero(boolMd()
+              envTriggersFromZero(boolMd(version)
                                       .withName(name + " Triggers from Zero")
                                       .withGroupName(name)
                                       .withDefault(false)
-                                      .withID((id1 > 0 ? id1 : (id0 + 13)) + 0))
+                                      .withID((id1 > 0 ? id1 : (id0 + 13)) + 0)),
+              envTempoSync(baseMd(version_120g) // non-automatable
+                               .asOnOffBool()
+                               .withName(name + " Env Temposync")
+                               .withGroupName(name)
+                               .withDefault(false)
+                               .withID((id1 > 0 ? id1 : (id0 + 13)) + 1))
         {
             delay.adhocFeatures = Param::AdHocFeatureValues::ENVTIME;
             attack.adhocFeatures = Param::AdHocFeatureValues::ENVTIME;
@@ -323,11 +444,17 @@ struct Patch : pats::PatchBase<Patch, Param>
             release.adhocFeatures = Param::AdHocFeatureValues::ENVTIME;
 
             triggerMode.adhocFeatures = Param::AdHocFeatureValues::TRIGGERMODE;
+
+            delay.tempoSyncPartner = &envTempoSync;
+            attack.tempoSyncPartner = &envTempoSync;
+            hold.tempoSyncPartner = &envTempoSync;
+            decay.tempoSyncPartner = &envTempoSync;
+            release.tempoSyncPartner = &envTempoSync;
         }
 
         Param delay, attack, hold, decay, sustain, release, envPower;
         Param aShape, dShape, rShape, triggerMode, envIsMultiplcative, envIsOneShot,
-            envTriggersFromZero;
+            envTriggersFromZero, envTempoSync;
 
         void appendDAHDSRParams(std::vector<Param *> &res)
         {
@@ -345,6 +472,7 @@ struct Patch : pats::PatchBase<Patch, Param>
             res.push_back(&envIsMultiplcative);
             res.push_back(&envIsOneShot);
             res.push_back(&envTriggersFromZero);
+            res.push_back(&envTempoSync);
         }
 
         enum DAHDSRTargets
@@ -354,7 +482,11 @@ struct Patch : pats::PatchBase<Patch, Param>
             ENV_HOLD = 41,
             ENV_DECAY = 42,
             ENV_SUSTAIN = 43,
-            ENV_RELEASE = 44
+            ENV_RELEASE = 44,
+            ENV_ASHAPE = 46,
+            ENV_DSHAPE = 47,
+            ENV_RSHAPE = 48,
+            ENV_RATE = 49
         };
 
         void appendDAHDSRTargetName(std::vector<std::pair<int32_t, std::string>> &res)
@@ -366,16 +498,22 @@ struct Patch : pats::PatchBase<Patch, Param>
             res.emplace_back(ENV_DECAY, "Env Decay");
             res.emplace_back(ENV_SUSTAIN, "Env Sustain");
             res.emplace_back(ENV_RELEASE, "Env Release");
+            res.emplace_back(-1, "");
+            res.emplace_back(ENV_ASHAPE, "Env Attack Shape");
+            res.emplace_back(ENV_DSHAPE, "Env Decay Shape");
+            res.emplace_back(ENV_RSHAPE, "Env Release Shape");
+            res.emplace_back(-1, "");
+            res.emplace_back(ENV_RATE, "Env Rate");
         }
     };
 
     struct ModulationMixin
     {
-        ModulationMixin(const std::string name, int id0)
+        ModulationMixin(const std::string name, int id0, uint64_t version = version_110)
             : modsource(scpu::make_array_lambda<Param, numModsPer>(
-                  [id0, name](int i)
+                  [id0, name, version](int i)
                   {
-                      return md_t()
+                      return baseMd(version)
                           .asInt()
                           .withRange(0, 8192)
                           .withID(id0 + 2 * i)
@@ -384,9 +522,9 @@ struct Patch : pats::PatchBase<Patch, Param>
                           .withDefault(0);
                   })),
               moddepth(scpu::make_array_lambda<Param, numModsPer>(
-                  [id0, name](int i)
+                  [id0, name, version](int i)
                   {
-                      return floatMd()
+                      return floatMd(version)
                           .asPercentBipolar()
                           .withID(id0 + 2 * i + 1)
                           .withName(name + " Mod Depth " + std::to_string(i))
@@ -419,8 +557,11 @@ struct Patch : pats::PatchBase<Patch, Param>
             DIRECT = 10,
             DIRECT_FINE = 11,
             STARTING_PHASE = 15,
+            MORPH = 16,
             ENV_DEPTH_ATTEN = 20,
             LFO_DEPTH_ATTEN = 30,
+            EXTEND_M = 18,
+            EXTEND_N = 19,
         };
 
         std::vector<std::pair<int32_t, std::string>> targetList{
@@ -429,9 +570,77 @@ struct Patch : pats::PatchBase<Patch, Param>
             {TargetID::DIRECT, "Ratio"},
             {TargetID::DIRECT_FINE, "Ratio (Fine)"},
             {TargetID::STARTING_PHASE, "Phase"},
+            {TargetID::MORPH, "Wavetable Morph"},
             {TargetID::ENV_DEPTH_ATTEN, "Env Atten"},
             {TargetID::LFO_DEPTH_ATTEN, "LFO Atten"},
+            {TargetID::SKIP, ""},
+            {TargetID::EXTEND_M, "Extended Mode M"},
+            {TargetID::EXTEND_N, "Extended Mode N"},
+        };
 
+        enum struct ExtendedMode : uint32_t
+        {
+            NONE = 0,           // these value stream
+            PHASE_REMAP = 1,    // CZ-style wave 1-4 wav(phase) -> wav(map(phase))
+            RESONANT_SWEEP = 2, // CZ-style resonant sweep (5-9)
+            NOISE = 3           // noise injection
+        };
+
+        enum struct NoiseMode : uint32_t
+        {
+            ADD_TO_PHASE = 0,
+            ADD_TO_SIGNAL = 1,
+            MIX_WITH_SIGNAL = 2,
+            MUL_BY_SIGNAL = 3,
+            MUL_BY_UNI_SIGNAL = 4,
+        };
+
+        enum struct NoiseType : uint32_t
+        {
+            WHITE = 0,
+            PINK = 1,
+            TILT = 2,
+            CHIP_LFSR = 3,
+        };
+
+        enum struct LFSRMode : uint32_t
+        {
+            SHORT = 0,
+            SHORT_KEYTRACK = 1,
+            LONG = 2,
+            LONG_KEYTRACK = 3,
+        };
+
+        // Noise samples come out of NoiseHelper normalized to ~±1. ADD_TO_PHASE
+        // attenuates further since one full cycle of phase jitter is too much.
+        static constexpr float noisePhaseScale = 0.33f;
+
+        enum struct PhaseMapShape : uint32_t
+        {
+            SAW = 0,
+            SQUARE = 1,
+            PULSE = 2,
+            DOUBLE = 3,
+            SIN_TO_SQUARE = 4,
+            DOUBLE_SAW = 5
+        };
+
+        enum struct ResonantSweepWindow : uint32_t
+        {
+            SAW = 0,
+            TRIANGLE = 1,
+            TRAPEZOID = 2,
+            FULLTRAP = 3,
+            HANN = 4,
+            BLACKMAN_HARRIS = 5,
+            TUKEY = 6,
+        };
+
+        enum struct ResonantSweepFrequencyDepth : uint32_t
+        {
+            TWO = 0,
+            FOUR = 1,
+            TEN = 2,
         };
 
         SourceNode(size_t idx)
@@ -515,6 +724,8 @@ struct Patch : pats::PatchBase<Patch, Param>
                                {SinTable::WaveForm::HALF_BLACKMAN_HARRIS_WINDOW,
                                 std::string() + u8"\U000000BD" + " Blackman Harris"},
                                {SinTable::WaveForm::TUKEY_WINDOW, "Tukey"},
+                               {SinTable::WaveForm::USER_TABLE, "Wavetable"},
+                               {SinTable::WaveForm::AUDIO_IN, "Audio In"},
                            })),
 
               keyTrack(boolMd()
@@ -532,7 +743,7 @@ struct Patch : pats::PatchBase<Patch, Param>
                                 .withGroupName(name(idx))
                                 .withDefault(0)
                                 .withRange(-70, 70)
-                                .withSemitoneZeroAt400Formatting()
+                                .withSemitoneZeroAt440Formatting()
                                 .withID(id(7, idx))),
               keyTrackLowFrequencyValue(
                   floatMd()
@@ -554,6 +765,13 @@ struct Patch : pats::PatchBase<Patch, Param>
                                .withRange(-3, 3)
                                .withDefault(0)
                                .withID(id(9, idx))),
+              absoluteOffset(floatMd(version_120h)
+                                 .withName(name(idx) + " Absolute Offset")
+                                 .withGroupName(name(idx))
+                                 .withRange(-50, 50)
+                                 .withLinearScaleFormatting("Hz")
+                                 .withDefault(0)
+                                 .withID(id(12, idx))),
               unisonParticipation(intMd()
                                       .withRange(0, 3)
                                       .withDefault(3)
@@ -589,13 +807,186 @@ struct Patch : pats::PatchBase<Patch, Param>
               modtarget(scpu::make_array_lambda<Param, numModsPer>(
                   [this, idx](int i)
                   {
-                      return md_t()
+                      return baseMd()
                           .withName(name(idx) + " Mod Target " + std::to_string(i))
                           .withGroupName(name(idx))
                           .withRange(0, 2000)
                           .withDefault(TargetID::NONE)
                           .withID(id(160 + i, idx));
-                  }))
+                  })),
+
+              // extended mode params start at 175
+              extendedModeMode(intMd(version_120b)
+                                   .withRange(0, 3)
+                                   .withDefault(0)
+                                   .withID(id(175, idx))
+                                   .withName(name(idx) + " Extended Mode")
+                                   .withGroupName(name(idx))
+                                   .withUnorderedMapFormatting({
+                                       {(int)ExtendedMode::NONE, "None"},
+                                       {(int)ExtendedMode::PHASE_REMAP, "Phase Map"},
+                                       {(int)ExtendedMode::RESONANT_SWEEP, "Resonant Sweep"},
+                                       {(int)ExtendedMode::NOISE, "Noise"},
+                                   })),
+              extendedModeM(floatMd(version_120b)
+                                .asPercent()
+                                .withName(name(idx) + " Extended Mode M")
+                                .withGroupName(name(idx))
+                                .withDefault(0.5f)
+                                .withID(id(176, idx))),
+              extendedModeN(floatMd(version_120b)
+                                .asPercent()
+                                .withPolarity(md_t::Polarity::BIPOLAR)
+                                .withName(name(idx) + " Extended Mode N")
+                                .withGroupName(name(idx))
+                                .withDefault(0.5f)
+                                .withID(id(177, idx))),
+              envToExtendedModeM(floatMd(version_120b)
+                                     .asPercentBipolar()
+                                     .withName(name(idx) + " Env to Extended Mode M")
+                                     .withGroupName(name(idx))
+                                     .withDefault(0.f)
+                                     .withID(id(178, idx))),
+              envToExtendedModeN(floatMd(version_120b)
+                                     .asPercentBipolar()
+                                     .withName(name(idx) + " Env to Extended Mode N")
+                                     .withGroupName(name(idx))
+                                     .withDefault(0.f)
+                                     .withID(id(179, idx))),
+              lfoToExtendedModeM(floatMd(version_120b)
+                                     .asPercentBipolar()
+                                     .withName(name(idx) + " LFO to Extended Mode M")
+                                     .withGroupName(name(idx))
+                                     .withDefault(0.f)
+                                     .withID(id(180, idx))),
+              lfoToExtendedModeN(floatMd(version_120b)
+                                     .asPercentBipolar()
+                                     .withName(name(idx) + " LFO to Extended Mode N")
+                                     .withGroupName(name(idx))
+                                     .withDefault(0.f)
+                                     .withID(id(181, idx))),
+              phaseMapModeShape(intMd(version_120b)
+                                    .withRange(0, 5)
+                                    .withDefault(0)
+                                    .withID(id(182, idx))
+                                    .withName(name(idx) + " Phase Map Shape")
+                                    .withGroupName(name(idx))
+                                    .withUnorderedMapFormatting({
+                                        {(int)PhaseMapShape::SAW, "Saw (CZ1)"},
+                                        {(int)PhaseMapShape::SQUARE, "Square (CZ2)"},
+                                        {(int)PhaseMapShape::PULSE, "Pulse (CZ3)"},
+                                        {(int)PhaseMapShape::DOUBLE, "Double (CZ4)"},
+                                        {(int)PhaseMapShape::SIN_TO_SQUARE, "Sin to Square"},
+                                        {(int)PhaseMapShape::DOUBLE_SAW, "Sin to Saw"},
+                                    })),
+              phaseMapReadPhase(floatMd(version_130a)
+                                    .asPercent()
+                                    .withName(name(idx) + " Phase Map Read Phase")
+                                    .withGroupName(name(idx))
+                                    .withDefault(0)
+                                    .withID(id(188, idx))),
+              wavetableBandLimit(
+                  intMd(version_130b)
+                      .withRange(0, 3)
+                      // Tapered by default: a brick wall band limit rings around every sharp
+                      // edge, and a wavetable that rings on load is a worse first impression
+                      // than one that is slightly softer than its source.
+                      .withDefault((int)WavetableBandLimit::BAND_LIMITED_TAPERED)
+                      .withName(name(idx) + " Wavetable Playback")
+                      .withGroupName(name(idx))
+                      .withID(id(192, idx))
+                      .withUnorderedMapFormatting(
+                          {{(int)WavetableBandLimit::BAND_LIMITED, "Band Limited"},
+                           {(int)WavetableBandLimit::BAND_LIMITED_TAPERED, "Band Limited Tapered"},
+                           {(int)WavetableBandLimit::DIRECT, "Direct"},
+                           {(int)WavetableBandLimit::DIRECT_ZOH, "Direct ZOH"}})),
+              wavetableMipChain(boolMd(version_130b)
+                                    .withName(name(idx) + " Wavetable Mip Chain")
+                                    .withGroupName(name(idx))
+                                    .withDefault(true)
+                                    .withID(id(193, idx))),
+              wavetableMorph(floatMd(version_130b)
+                                 .asPercent()
+                                 .withName(name(idx) + " Wavetable Morph")
+                                 .withGroupName(name(idx))
+                                 .withDefault(0)
+                                 .withID(id(189, idx))),
+              envToWavetableMorph(floatMd(version_130b)
+                                      .asPercentBipolar()
+                                      .withName(name(idx) + " Env to Wavetable Morph")
+                                      .withGroupName(name(idx))
+                                      .withDefault(0)
+                                      .withID(id(190, idx))),
+              lfoToWavetableMorph(floatMd(version_130b)
+                                      .asPercentBipolar()
+                                      .withName(name(idx) + " LFO to Wavetable Morph")
+                                      .withGroupName(name(idx))
+                                      .withDefault(0)
+                                      .withID(id(191, idx))),
+              resonantSweepWindowShape(
+                  intMd(version_120d)
+                      .withRange(0, 6)
+                      .withDefault(0)
+                      .withID(id(183, idx))
+                      .withName(name(idx) + " Resonant Sweep Window")
+                      .withGroupName(name(idx))
+                      .withUnorderedMapFormatting({
+                          {(int)ResonantSweepWindow::SAW, "Saw"},
+                          {(int)ResonantSweepWindow::TRIANGLE, "Tri"},
+                          {(int)ResonantSweepWindow::TRAPEZOID, "1/2 Trap"},
+                          {(int)ResonantSweepWindow::FULLTRAP, "Full Trap"},
+                          {(int)ResonantSweepWindow::HANN, "Hann"},
+                          {(int)ResonantSweepWindow::BLACKMAN_HARRIS, "Blkmn/Harris"},
+                          {(int)ResonantSweepWindow::TUKEY, "Tukey"},
+                      })),
+              resonantSweepFrequencyDepth(intMd(version_120d)
+                                              .withRange(0, 2)
+                                              .withDefault(1)
+                                              .withID(id(184, idx))
+                                              .withName(name(idx) + " Sweep Depth")
+                                              .withGroupName(name(idx))
+                                              .withUnorderedMapFormatting({
+                                                  {(int)ResonantSweepFrequencyDepth::TWO, "2 oct"},
+                                                  {(int)ResonantSweepFrequencyDepth::FOUR, "4 oct"},
+                                                  {(int)ResonantSweepFrequencyDepth::TEN, "10 oct"},
+                                              })),
+              noiseMode(intMd(version_120f)
+                            .withRange(0, 4)
+                            .withDefault(0)
+                            .withID(id(185, idx))
+                            .withName(name(idx) + " Noise Mode")
+                            .withGroupName(name(idx))
+                            .withUnorderedMapFormatting({
+                                {(int)NoiseMode::ADD_TO_PHASE, "Add to Phase"},
+                                {(int)NoiseMode::ADD_TO_SIGNAL, "Add to Signal"},
+                                {(int)NoiseMode::MIX_WITH_SIGNAL, "Mix"},
+                                {(int)NoiseMode::MUL_BY_SIGNAL, "Mul by Signal"},
+                                {(int)NoiseMode::MUL_BY_UNI_SIGNAL, "Mul by Uni Signal"},
+                            })),
+              noiseType(intMd(version_120f)
+                            .withRange(0, 3)
+                            .withDefault((int)NoiseType::PINK)
+                            .withID(id(186, idx))
+                            .withName(name(idx) + " Noise Type")
+                            .withGroupName(name(idx))
+                            .withUnorderedMapFormatting({
+                                {(int)NoiseType::WHITE, "White"},
+                                {(int)NoiseType::PINK, "Pink"},
+                                {(int)NoiseType::TILT, "Tilt"},
+                                {(int)NoiseType::CHIP_LFSR, "Chip LFSR"},
+                            })),
+              lfsrMode(intMd(version_120f)
+                           .withRange(0, 3)
+                           .withDefault((int)LFSRMode::LONG_KEYTRACK)
+                           .withID(id(187, idx))
+                           .withName(name(idx) + " LFSR Mode")
+                           .withGroupName(name(idx))
+                           .withUnorderedMapFormatting({
+                               {(int)LFSRMode::SHORT, "Short"},
+                               {(int)LFSRMode::SHORT_KEYTRACK, "Short Keytrack"},
+                               {(int)LFSRMode::LONG, "Long"},
+                               {(int)LFSRMode::LONG_KEYTRACK, "Long Keytrack"},
+                           }))
 
         {
             index = idx;
@@ -625,9 +1016,38 @@ struct Patch : pats::PatchBase<Patch, Param>
 
         Param keyTrack, keyTrackValue, keyTrackLowFrequencyValue, keyTrackValueIsLow;
 
-        Param startingPhase, octTranspose;
+        Param startingPhase, octTranspose, absoluteOffset;
 
         Param unisonParticipation, unisonToMain, unisonToOpOut;
+
+        // extended mode params
+        Param extendedModeMode;
+        Param extendedModeM, extendedModeN;
+        Param envToExtendedModeM, envToExtendedModeN;
+        Param lfoToExtendedModeM, lfoToExtendedModeN;
+
+        /*
+         * The wavetable this operator uses. Not a Param - it streams as a blob rather than a
+         * value - but it follows the same mirroring as one: patchMain's copy is written on the
+         * main thread, patch's copy is written on the audio thread when a SET_WAVETABLE
+         * arrives. A built table is immutable, so reads need no synchronisation; only these
+         * two shared_ptr *objects* are single-threaded, one per side.
+         *
+         * blobIndex is main-only bookkeeping: which of Patch::wavetableBlobs this came from.
+         */
+        int wavetableBlobIndex{-1};
+        std::shared_ptr<const Wavetable> wavetable;
+
+        Param phaseMapModeShape;
+        Param phaseMapReadPhase;
+        Param wavetableBandLimit, wavetableMipChain;
+        Param wavetableMorph;
+        Param envToWavetableMorph, lfoToWavetableMorph;
+        Param resonantSweepWindowShape;
+        Param resonantSweepFrequencyDepth;
+        Param noiseMode;
+        Param noiseType;
+        Param lfsrMode;
 
         std::array<Param, numModsPer> modtarget;
 
@@ -644,11 +1064,31 @@ struct Patch : pats::PatchBase<Patch, Param>
                                      &keyTrackValue,
                                      &startingPhase,
                                      &octTranspose,
+                                     &absoluteOffset,
                                      &envToRatioFine,
                                      &lfoToRatioFine,
                                      &unisonParticipation,
                                      &unisonToMain,
-                                     &unisonToOpOut};
+                                     &unisonToOpOut,
+                                     &extendedModeMode,
+                                     &extendedModeM,
+                                     &extendedModeN,
+                                     &envToExtendedModeM,
+                                     &envToExtendedModeN,
+                                     &lfoToExtendedModeM,
+                                     &lfoToExtendedModeN,
+                                     &phaseMapModeShape,
+                                     &phaseMapReadPhase,
+                                     &wavetableBandLimit,
+                                     &wavetableMipChain,
+                                     &wavetableMorph,
+                                     &envToWavetableMorph,
+                                     &lfoToWavetableMorph,
+                                     &resonantSweepWindowShape,
+                                     &resonantSweepFrequencyDepth,
+                                     &noiseMode,
+                                     &noiseType,
+                                     &lfsrMode};
             for (int i = 0; i < numModsPer; ++i)
                 res.push_back(&modtarget[i]);
             appendDAHDSRParams(res);
@@ -690,7 +1130,8 @@ struct Patch : pats::PatchBase<Patch, Param>
                          .withGroupName(name(idx))
                          .withDefault(false)
                          .withID(id(1, idx))),
-              DAHDSRMixin(name(idx), id(2, idx), false), LFOMixin(name(idx), id(15, idx)),
+              DAHDSRMixin(name(idx), id(2, idx), false, false, id(90, idx)),
+              LFOMixin(name(idx), id(15, idx), id(60, idx)),
               lfoToFB(floatMd()
                           .asPercentBipolar()
                           .withName(name(idx) + " LFO to FB Amplitude")
@@ -708,11 +1149,18 @@ struct Patch : pats::PatchBase<Patch, Param>
                             .withGroupName(name(idx))
                             .withDefault(false)
                             .withID(id(28, idx))),
+              lfoFBMode(intMd(version_120h)
+                            .withName(name(idx) + " LFO FB Mode")
+                            .withGroupName(name(idx))
+                            .withRange(0, 2)
+                            .withDefault(0)
+                            .withID(id(29, idx))
+                            .withUnorderedMapFormatting({{0, "Add"}, {1, "Scale"}, {2, "Atten"}})),
               ModulationMixin(name(idx), id(40, idx)),
               modtarget(scpu::make_array_lambda<Param, numModsPer>(
                   [this, idx](int i)
                   {
-                      return md_t()
+                      return baseMd()
                           .withName(name(idx) + " Mod Target " + std::to_string(i))
                           .withGroupName(name(idx))
                           .withRange(0, 2000)
@@ -736,14 +1184,14 @@ struct Patch : pats::PatchBase<Patch, Param>
             return name(index);
         }
 
-        Param fbLevel, lfoToFB, envToFB, overdrive;
+        Param fbLevel, lfoToFB, envToFB, overdrive, lfoFBMode;
         Param active;
 
         std::array<Param, numModsPer> modtarget;
 
         std::vector<Param *> params()
         {
-            std::vector<Param *> res{&fbLevel, &active, &lfoToFB, &envToFB, &overdrive};
+            std::vector<Param *> res{&fbLevel, &active, &lfoToFB, &envToFB, &overdrive, &lfoFBMode};
             appendDAHDSRParams(res);
             appendLFOParams(res);
 
@@ -808,7 +1256,7 @@ struct Patch : pats::PatchBase<Patch, Param>
                                   .withUnorderedMapFormatting(
                                       {{0, "Signal"}, {1, "abs(Signal)"}, {2, "(1+Signal)/2"}})),
               DAHDSRMixin(name(idx), id(2, idx), false, false, id(50, idx)),
-              LFOMixin(name(idx), id(14, idx)),
+              LFOMixin(name(idx), id(14, idx), id(90, idx)),
               lfoToDepth(floatMd()
                              .asPercentBipolar()
                              .withName(name(idx) + " LFO to Depth")
@@ -826,12 +1274,20 @@ struct Patch : pats::PatchBase<Patch, Param>
                             .withGroupName(name(idx))
                             .withDefault(false)
                             .withID(id(28, idx))),
+              lfoDepthMode(
+                  intMd(version_120h)
+                      .withName(name(idx) + " LFO Depth Mode")
+                      .withGroupName(name(idx))
+                      .withRange(0, 2)
+                      .withDefault(0)
+                      .withID(id(29, idx))
+                      .withUnorderedMapFormatting({{0, "Add"}, {1, "Scale"}, {2, "Atten"}})),
 
               ModulationMixin(name(idx), id(70, idx)),
               modtarget(scpu::make_array_lambda<Param, numModsPer>(
                   [this, idx](int i)
                   {
-                      return md_t()
+                      return baseMd()
                           .withName(name(idx) + " Mod Target " + std::to_string(i))
                           .withGroupName(name(idx))
                           .withRange(0, 2000)
@@ -851,6 +1307,7 @@ struct Patch : pats::PatchBase<Patch, Param>
         Param lfoToDepth;
         Param envToLevel;
         Param overdrive;
+        Param lfoDepthMode;
 
         std::array<Param, numModsPer> modtarget;
 
@@ -873,7 +1330,7 @@ struct Patch : pats::PatchBase<Patch, Param>
         std::vector<Param *> params()
         {
             std::vector<Param *> res{&level,      &active,     &modulationMode, &modulationScale,
-                                     &lfoToDepth, &envToLevel, &overdrive};
+                                     &lfoToDepth, &envToLevel, &overdrive,      &lfoDepthMode};
             appendDAHDSRParams(res);
             appendLFOParams(res);
 
@@ -932,7 +1389,7 @@ struct Patch : pats::PatchBase<Patch, Param>
                       .withGroupName(name(idx))
                       .withDefault(0.f)
                       .withID(id(15, idx))),
-              LFOMixin(name(idx), id(30, idx)),
+              LFOMixin(name(idx), id(30, idx), id(65, idx)),
               lfoToLevel(floatMd()
                              .asPercentBipolar()
                              .withName(name(idx) + " LFO to Level")
@@ -956,11 +1413,19 @@ struct Patch : pats::PatchBase<Patch, Param>
                        .withGroupName(name(idx))
                        .withID(id(43, idx))
                        .withDefault(false)),
+              lfoLevelMode(
+                  intMd(version_120g)
+                      .withName(name(idx) + " LFO Level Mode")
+                      .withGroupName(name(idx))
+                      .withRange(0, 2)
+                      .withDefault(0)
+                      .withID(id(44, idx))
+                      .withUnorderedMapFormatting({{0, "Add"}, {1, "Scale"}, {2, "Atten"}})),
               ModulationMixin(name(idx), id(50, idx)),
               modtarget(scpu::make_array_lambda<Param, numModsPer>(
                   [this, idx](int i)
                   {
-                      return md_t()
+                      return baseMd()
                           .withName(name(idx) + " Mod Target " + std::to_string(i))
                           .withGroupName(name(idx))
                           .withRange(0, 2000)
@@ -986,15 +1451,15 @@ struct Patch : pats::PatchBase<Patch, Param>
             return name(index);
         }
 
-        Param level, pan, lfoToLevel, lfoToPan, envToLevel, solo;
+        Param level, pan, lfoToLevel, lfoToPan, envToLevel, solo, lfoLevelMode;
         Param active;
         std::array<Param, numModsPer> modtarget;
         bool isMutedDueToSoloAway{false};
 
         std::vector<Param *> params()
         {
-            std::vector<Param *> res{&level,    &active,     &pan, &lfoToLevel,
-                                     &lfoToPan, &envToLevel, &solo};
+            std::vector<Param *> res{&level,    &active,     &pan,  &lfoToLevel,
+                                     &lfoToPan, &envToLevel, &solo, &lfoLevelMode};
             appendDAHDSRParams(res);
             appendLFOParams(res);
 
@@ -1006,9 +1471,23 @@ struct Patch : pats::PatchBase<Patch, Param>
         }
     };
 
-    struct MacroNode
+    struct MacroNode : public DAHDSRMixin, public LFOMixin, public ModulationMixin
     {
         static constexpr uint32_t idBase{40000}, idStride{250};
+
+        enum TargetID : int32_t
+        {
+            SKIP = -1,
+            NONE = 0,
+            LEVEL = 10,
+            DEPTH_ATTEN = 20,
+        };
+
+        std::vector<std::pair<int32_t, std::string>> targetList{
+            {TargetID::NONE, "Off"},    {TargetID::SKIP, ""},
+            {TargetID::LEVEL, "Level"}, {TargetID::DEPTH_ATTEN, "Depth Atten"},
+            {TargetID::SKIP, ""},
+        };
 
         MacroNode(size_t idx)
             : level(floatMd()
@@ -1016,18 +1495,82 @@ struct Patch : pats::PatchBase<Patch, Param>
                         .withGroupName(name(idx))
                         .withName(name(idx) + " Level")
                         .withID(id(0, idx))
-                        .withDefault(0))
+                        .withDefault(0)
+                        .withFeature(isPrimaryMacroFeature)),
+              macroPower(boolMd(version_120c)
+                             .withGroupName(name(idx))
+                             .withName(name(idx) + " Power")
+                             .withID(id(1, idx))
+                             .withDefault(false)),
+              envDepth(floatMd(version_120c)
+                           .asPercentBipolar()
+                           .withGroupName(name(idx))
+                           .withName(name(idx) + " Env Depth")
+                           .withID(id(15, idx))
+                           .withDefault(0)),
+              lfoDepth(floatMd(version_120c)
+                           .asPercentBipolar()
+                           .withGroupName(name(idx))
+                           .withName(name(idx) + " LFO Depth")
+                           .withID(id(16, idx))
+                           .withDefault(1)),
+              lfoLevelMode(
+                  intMd(version_120h)
+                      .withName(name(idx) + " LFO Level Mode")
+                      .withGroupName(name(idx))
+                      .withRange(0, 2)
+                      .withDefault(0)
+                      .withID(id(17, idx))
+                      .withUnorderedMapFormatting({{0, "Add"}, {1, "Scale"}, {2, "Atten"}})),
+              DAHDSRMixin(name(idx), id(2, idx), false, false, id(20, idx), version_120c),
+              LFOMixin(name(idx), id(30, idx), id(65, idx), version_120c),
+              ModulationMixin(name(idx), id(50, idx), version_120c),
+              modtarget(scpu::make_array_lambda<Param, numModsPer>(
+                  [this, idx](int i)
+                  {
+                      return baseMd(version_120c)
+                          .withName(name(idx) + " Mod Target " + std::to_string(i))
+                          .withGroupName(name(idx))
+                          .withRange(0, 2000)
+                          .withDefault(TargetID::NONE)
+                          .withID(id(60 + i, idx));
+                  }))
         {
+            index = idx;
+            appendLFOTargetName(targetList);
+            appendDAHDSRTargetName(targetList);
         }
 
-        std::string name(int idx) const { return "Macro " + std::to_string(idx + 1); }
+        std::string name(int idx) const { return defaultGroupName(idx); }
         uint32_t id(int f, int idx) const { return idBase + idStride * idx + f; }
 
+        // Default group name. Used by name(idx) and by paramsInfo when building
+        // the "(Macro N)" suffix for the user-renamed level param.
+        static std::string defaultGroupName(int idx) { return "Macro " + std::to_string(idx + 1); }
+
+        int index{-1};
+        std::string name() const
+        {
+            if (index < 0)
+                throw std::runtime_error("Only call this post setup");
+            return name(index);
+        }
+
         Param level;
+        Param macroPower;
+        Param envDepth, lfoDepth, lfoLevelMode;
+        std::array<Param, numModsPer> modtarget;
 
         std::vector<Param *> params()
         {
-            std::vector<Param *> res{&level};
+            std::vector<Param *> res{&level, &macroPower, &envDepth, &lfoDepth, &lfoLevelMode};
+            appendDAHDSRParams(res);
+            appendLFOParams(res);
+
+            for (int i = 0; i < numModsPer; ++i)
+                res.push_back(&modtarget[i]);
+            appendModulationParams(res);
+
             return res;
         }
     };
@@ -1065,7 +1608,7 @@ struct Patch : pats::PatchBase<Patch, Param>
               modtarget(scpu::make_array_lambda<Param, numModsPer>(
                   [this, opName, idx](int i)
                   {
-                      return md_t()
+                      return baseMd()
                           .withName(opName + " Mod Target " + std::to_string(i))
                           .withGroupName(opName)
                           .withRange(0, 2000)
@@ -1126,7 +1669,7 @@ struct Patch : pats::PatchBase<Patch, Param>
             COARSE = 11
         };
         FineTuneNode()
-            : ModulationOnlyNode("Fine Tune Mod", "Fine Tune", 0),
+            : ModulationOnlyNode("Main Tune", "Main Tune", 0),
               coarseTune(floatMd()
                              .withName(name() + " Coarse Tuning")
                              .withGroupName(name())
@@ -1209,7 +1752,7 @@ struct Patch : pats::PatchBase<Patch, Param>
                                  .withGroupName(name())
                                  .withDefault(0.2)
                                  .withID(id(22))),
-              playMode(md_t()
+              playMode(baseMd()
                            .asInt()
                            .withRange(0, 1)
                            .withName(name() + " Play Mode")
@@ -1231,7 +1774,7 @@ struct Patch : pats::PatchBase<Patch, Param>
                            .withDefault(2)
                            .withID(id(25))
                            .withLinearScaleFormatting("")),
-              polyLimit(md_t()
+              polyLimit(baseMd()
                             .asInt()
                             .withRange(1, maxVoices)
                             .withName(name() + " PolyLimit")
@@ -1240,7 +1783,7 @@ struct Patch : pats::PatchBase<Patch, Param>
                             .withID(id(26))
                             .withLinearScaleFormatting("")),
               defaultTrigger(
-                  md_t()
+                  baseMd()
                       .asInt()
                       .withRange(0, 1)
                       .withName(name() + " Default Env Mode")
@@ -1267,8 +1810,8 @@ struct Patch : pats::PatchBase<Patch, Param>
                       .withGroupName(name())
                       .withUnorderedMapFormatting({{0, "Reset"}, {1, "Pause"}, {2, "Continue"}})),
 
-              pianoModeActive(md_t()
-                                  .asBool()
+              pianoModeActive(baseMd()
+                                  .asOnOffBool()
                                   .withName(name() + " Piano Mode Active")
                                   .withGroupName(name())
                                   .withDefault(true)
@@ -1292,17 +1835,21 @@ struct Patch : pats::PatchBase<Patch, Param>
                                .withGroupName(name())
                                .withDefault(true)
                                .withID(id(32))),
-              mpeActive(boolMd()
-                            .withName(name() + " MPE Active")
-                            .withGroupName(name())
-                            .withDefault(false)
-                            .withID(id(33))),
-              mpeBendRange(intMd()
-                               .withName(name() + " MPE Bend Range")
-                               .withGroupName(name())
-                               .withRange(1, 96)
-                               .withDefault(24)
-                               .withID(id(34))),
+              // Legacy in 1.1 these stored per-patch MPE config. Now lives on the engine
+              // (MonoValues + DawExtraState). Kept as id-stable slots so 1.1 sessions
+              // still deserialize; the value is only read as a fallback in
+              // Synth::handleSetDawExtraState when the incoming DES has no MPE entries.
+              legacyMpeActive(boolMd()
+                                  .withName(name() + " Unused (was MPE Active)")
+                                  .withGroupName(name())
+                                  .withDefault(false)
+                                  .withID(id(33))),
+              legacyMpeBendRange(intMd()
+                                     .withName(name() + " Unused (was MPE Bend Range)")
+                                     .withGroupName(name())
+                                     .withRange(1, 96)
+                                     .withDefault(24)
+                                     .withID(id(34))),
               octTranspose(intMd()
                                .withName(name() + " Octave Transpose")
                                .withGroupName(name())
@@ -1310,7 +1857,7 @@ struct Patch : pats::PatchBase<Patch, Param>
                                .withDefault(0)
                                .withID(id(35))),
               fineTune(floatMd()
-                           .withName(name() + " Fine Tuning")
+                           .withName(name() + " Tune Fine Tuning")
                            .withGroupName(name())
                            .withRange(-200, 200)
                            .withDefault(0)
@@ -1362,6 +1909,103 @@ struct Patch : pats::PatchBase<Patch, Param>
                                      {ResamplerEngine::LINTERP, "Linear Interp"},
                                      {ResamplerEngine::ZOH, "ZOH"},
                                  })),
+              saturationType(intMd(version_120e)
+                                 .withName(name() + " Saturation Type")
+                                 .withGroupName(name())
+                                 .withDefault(SaturationType::SAT_NONE)
+                                 .withRange(SaturationType::SAT_NONE, SaturationType::SAT_OJD)
+                                 .withID(id(50))
+                                 .withUnorderedMapFormatting({
+                                     {SaturationType::SAT_NONE, "None"},
+                                     {SaturationType::SAT_SOFT, "Soft"},
+                                     {SaturationType::SAT_OJD, "OJD"},
+                                 })),
+              saturationDrive(floatMd(version_120e)
+                                  .asCubicDecibelUpTo(0.f)
+                                  .withRange(1.f, 3.f)
+                                  .withDefault(1.f)
+                                  .withName(name() + " Saturation Drive")
+                                  .withGroupName(name())
+                                  .withID(id(51))),
+              lowpass(intMd(version_120e)
+                          .withName(name() + " Low Pass")
+                          .withGroupName(name())
+                          .withDefault(LowpassMode::LP_NONE)
+                          .withRange(LowpassMode::LP_NONE, LowpassMode::LP_20K)
+                          .withID(id(52))
+                          .withUnorderedMapFormatting({
+                              {LowpassMode::LP_NONE, "None"},
+                              {LowpassMode::LP_7K5, "7.5 kHz"},
+                              {LowpassMode::LP_10K, "10 kHz"},
+                              {LowpassMode::LP_13K, "13 kHz"},
+                              {LowpassMode::LP_16K, "16 kHz"},
+                              {LowpassMode::LP_20K, "20 kHz"},
+                          })),
+              bitRateAdjust(intMd(version_120e)
+                                .withName(name() + " Bit Rate Adjust")
+                                .withGroupName(name())
+                                .withDefault(BitRateMode::BR_NONE)
+                                .withRange(BitRateMode::BR_NONE, BitRateMode::BR_48K_ZOH)
+                                .withID(id(53))
+                                .withUnorderedMapFormatting({
+                                    {BitRateMode::BR_NONE, "None"},
+                                    {BitRateMode::BR_12K_ZOH, "12 kHz ZOH"},
+                                    {BitRateMode::BR_16K_ZOH, "16 kHz ZOH"},
+                                    {BitRateMode::BR_18K_ZOH, "18 kHz ZOH"},
+                                    {BitRateMode::BR_20K_ZOH, "20 kHz ZOH"},
+                                    {BitRateMode::BR_22K_ZOH, "22 kHz ZOH"},
+                                    {BitRateMode::BR_24K_ZOH, "24 kHz ZOH"},
+                                    {BitRateMode::BR_28K_ZOH, "28 kHz ZOH"},
+                                    {BitRateMode::BR_32K_ZOH, "32 kHz ZOH"},
+                                    {BitRateMode::BR_48K_ZOH, "48 kHz ZOH"},
+                                })),
+              zohPreFilter(boolMd(version_120g)
+                               .withName(name() + " ZOH Pre-Filter")
+                               .withGroupName(name())
+                               .withDefault(true)
+                               .withID(id(57))),
+              ultrasonicFilter(boolMd(version_120g)
+                                   .withName(name() + " Ultrasonic Filter")
+                                   .withGroupName(name())
+                                   .withDefault(false)
+                                   .withID(id(58))),
+              legacyDsp(boolMd(version_130c)
+                            .withName(name() + " Legacy 1.2 DSP")
+                            .withGroupName(name())
+                            .withDefault(false)
+                            .withID(id(59))),
+              bitDepthAdjust(intMd(version_120e)
+                                 .withName(name() + " Bit Depth Adjust")
+                                 .withGroupName(name())
+                                 .withDefault(BitDepthMode::BD_NONE)
+                                 .withRange(BitDepthMode::BD_NONE, BitDepthMode::BD_16)
+                                 .withID(id(54))
+                                 .withUnorderedMapFormatting({
+                                     {BitDepthMode::BD_NONE, "None"},
+                                     {BitDepthMode::BD_8, "8 bit"},
+                                     {BitDepthMode::BD_12, "12 bit"},
+                                     {BitDepthMode::BD_16, "16 bit"},
+                                 })),
+              highpass(intMd(version_120e)
+                           .withName(name() + " High Pass")
+                           .withGroupName(name())
+                           .withDefault(HighpassMode::HP_NONE)
+                           .withRange(HighpassMode::HP_NONE, HighpassMode::HP_50HZ)
+                           .withID(id(55))
+                           .withUnorderedMapFormatting({
+                               {HighpassMode::HP_NONE, "None"},
+                               {HighpassMode::HP_10HZ, "10 Hz"},
+                               {HighpassMode::HP_20HZ, "20 Hz"},
+                               {HighpassMode::HP_50HZ, "50 Hz"},
+                           })),
+              outputGain(floatMd(version_120e)
+                             .asCubicDecibelUpTo(0.f)
+                             .withRange(0.f, 2.f)
+                             .withDefault(1.f)
+                             .withPolarity(md_t::Polarity::BIPOLAR)
+                             .withName(name() + " Output Gain")
+                             .withGroupName(name())
+                             .withID(id(56))),
               unisonPan(floatMd()
                             .withName(name() + " Unison Stereo Field")
                             .asPercent()
@@ -1372,19 +2016,19 @@ struct Patch : pats::PatchBase<Patch, Param>
               modtarget(scpu::make_array_lambda<Param, numModsPer>(
                   [this](int i)
                   {
-                      return md_t()
+                      return baseMd()
                           .withName(name() + " Mod Target " + std::to_string(i))
                           .withGroupName(name())
                           .withRange(0, 2000)
                           .withDefault(TargetID::NONE)
                           .withID(id(150 + i));
                   })),
-              LFOMixin(name(), id(200)), lfoDepth(floatMd()
-                                                      .asPercentBipolar()
-                                                      .withName(name() + " LFO Depth")
-                                                      .withGroupName(name())
-                                                      .withDefault(0)
-                                                      .withID(id(220)))
+              LFOMixin(name(), id(200), id(230)), lfoDepth(floatMd()
+                                                               .asPercentBipolar()
+                                                               .withName(name() + " LFO Depth")
+                                                               .withGroupName(name())
+                                                               .withDefault(0)
+                                                               .withID(id(220)))
         {
             defaultTrigger.adhocFeatures = Param::AdHocFeatureValues::TRIGGERMODE;
             appendLFOTargetName(targetList);
@@ -1398,10 +2042,16 @@ struct Patch : pats::PatchBase<Patch, Param>
         Param bendUp, bendDown, polyLimit, defaultTrigger, portaTime, portaContMode,
             pianoModeActive;
         Param unisonCount, unisonSpread, uniPhaseRand, unisonPan;
-        Param mpeActive, mpeBendRange;
+        Param legacyMpeActive, legacyMpeBendRange;
         Param octTranspose, fineTune, pan, lfoDepth;
         Param attackFloorOnRetrig, rephaseOnRetrigger;
         Param sampleRateStrategy, resampleEngine;
+        Param saturationType, saturationDrive;
+        Param lowpass, bitRateAdjust, zohPreFilter, bitDepthAdjust, highpass;
+        Param ultrasonicFilter;
+        Param outputGain;
+        // 1.2's dsp: uncleared output bus, old squarish / sawish / blackman harris, no rm dc block
+        Param legacyDsp;
 
         std::array<Param, numModsPer> modtarget;
 
@@ -1421,8 +2071,8 @@ struct Patch : pats::PatchBase<Patch, Param>
                                      &unisonSpread,
                                      &unisonPan,
                                      &uniPhaseRand,
-                                     &mpeActive,
-                                     &mpeBendRange,
+                                     &legacyMpeActive,
+                                     &legacyMpeBendRange,
                                      &octTranspose,
                                      &pan,
                                      &fineTune,
@@ -1430,7 +2080,17 @@ struct Patch : pats::PatchBase<Patch, Param>
                                      &attackFloorOnRetrig,
                                      &rephaseOnRetrigger,
                                      &sampleRateStrategy,
-                                     &resampleEngine};
+                                     &resampleEngine,
+                                     &saturationType,
+                                     &saturationDrive,
+                                     &ultrasonicFilter,
+                                     &lowpass,
+                                     &bitRateAdjust,
+                                     &zohPreFilter,
+                                     &bitDepthAdjust,
+                                     &highpass,
+                                     &outputGain,
+                                     &legacyDsp};
             appendDAHDSRParams(res);
 
             for (int i = 0; i < numModsPer; ++i)
@@ -1452,7 +2112,69 @@ struct Patch : pats::PatchBase<Patch, Param>
     FineTuneNode fineTuneMod;
     MainPanNode mainPanMod;
 
-    char name[256]{"Init"};
+    std::string defaultAuthor{};
+    char name[stringBufferLen]{"Init"};
+    char author[stringBufferLen]{""};
+    std::array<std::array<char, 64>, numMacros> macroNames;
+
+    /*
+     * Wavetables are main-thread-only patch state, the same shape of thing as macroNames but
+     * an order of magnitude larger. The patch carries the *source bytes* rather than anything
+     * derived, so loading a file and rehydrating a patch are literally the same code path,
+     * and so a later change to table resolution or mip strategy breaks nothing already saved.
+     *
+     * Blobs are deduplicated by content, and operators reference them by index, so two
+     * operators sharing a table cost one blob in the file and one allocation in memory.
+     */
+    struct WavetableBlob
+    {
+        uint64_t hash{0};
+        std::string name;
+        // Where it came from, so the UI can step through its neighbours. Best effort: the file
+        // may be gone by the time a patch is reopened, and the table plays regardless because
+        // the bytes travel with the patch.
+        fs::path sourcePath;
+        std::vector<uint8_t> sourceBytes;
+    };
+    std::vector<WavetableBlob> wavetableBlobs;
+
+    // Append, or hand back the index these bytes already occupy. -1 when they are empty.
+    int addWavetableBlob(const std::vector<uint8_t> &bytes, const std::string &name,
+                         const fs::path &sourcePath = {});
+    void clearWavetables();
+    void readWavetablesFromState(TiXmlElement *root);
+
+    // Soft limit on the encoded payload. Warn on an explicit save past this; never in
+    // stateSave, which must not dialog, block or fail.
+    static constexpr size_t wavetablePayloadWarnBytes{5 * 1024 * 1024};
+    size_t encodedWavetableBytes() const;
+
+    // Value-only copy between two Patch instances. NEVER use operator= : params/paramMap hold
+    // Param* into the owning Patch, so assignment would alias them across objects. Copies every
+    // param value plus the non-Param streamed state (macroNames + name + author) and dirty.
+    // defaultAuthor is a main-thread editor default, not streamed — deliberately not copied so a
+    // load doesn't wipe the user's default author.
+    void copyValuesFrom(const Patch &o)
+    {
+        for (const auto *p : o.params)
+            paramMap.at(p->meta.id)->value = p->value;
+        macroNames = o.macroNames;
+        /*
+         * Wavetable blobs and the per-node index are patch state but not Params, so they have
+         * to be carried explicitly - a host stateLoad parses into a temp patch and copies from
+         * it, and without this the waveform restores as USER_TABLE with nothing behind it.
+         *
+         * The built table is deliberately NOT copied. The two patches sit on different threads
+         * and each owns its own shared_ptr; writing one from the other is exactly what the
+         * handoff exists to avoid. reconcileWavetables rebuilds and publishes instead.
+         */
+        wavetableBlobs = o.wavetableBlobs;
+        for (size_t i = 0; i < sourceNodes.size(); ++i)
+            sourceNodes[i].wavetableBlobIndex = o.sourceNodes[i].wavetableBlobIndex;
+        memcpy(name, o.name, sizeof(name));
+        memcpy(author, o.author, sizeof(author));
+        dirty = o.dirty;
+    }
 
     float migrateParamValueFromVersion(Param *p, float value, uint32_t version);
     void migratePatchFromVersion(uint32_t version);

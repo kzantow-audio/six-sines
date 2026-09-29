@@ -25,7 +25,7 @@ MixerPanel::MixerPanel(SixSinesEditor &e) : jcmp::NamedPanel("Mixer"), HasEditor
 {
     using kt_t = sst::jucegui::accessibility::KeyboardTraverser;
 
-    auto &mn = editor.patchCopy.mixerNodes;
+    auto &mn = editor.patchMainRef.mixerNodes;
     for (auto i = 0U; i < numOps; ++i)
     {
         createComponent(editor, *this, mn[i].level, knobs[i], knobsData[i], i);
@@ -36,6 +36,11 @@ MixerPanel::MixerPanel(SixSinesEditor &e) : jcmp::NamedPanel("Mixer"), HasEditor
         power[i]->setDrawMode(sst::jucegui::components::ToggleButton::DrawMode::GLYPH);
         power[i]->setGlyph(sst::jucegui::components::GlyphPainter::POWER);
         addAndMakeVisible(*power[i]);
+        powerData[i]->onGuiSetValue = [w = juce::Component::SafePointer(this)]()
+        {
+            if (w)
+                w->optionalAllSoundsOffOnToggle();
+        };
 
         createComponent(editor, *this, mn[i].solo, solo[i], soloData[i], i);
         solo[i]->setLabel("S");
@@ -49,10 +54,11 @@ MixerPanel::MixerPanel(SixSinesEditor &e) : jcmp::NamedPanel("Mixer"), HasEditor
         {
             if (!w)
                 return;
-            w->editor.setAndSendParamValue(w->editor.patchCopy.mixerNodes[i].active.meta.id, true,
+            w->editor.setAndSendParamValue(w->editor.patchMainRef.mixerNodes[i].active.meta.id, true,
                                            true);
-            w->editor.setAndSendParamValue(w->editor.patchCopy.sourceNodes[i].active.meta.id, true,
+            w->editor.setAndSendParamValue(w->editor.patchMainRef.sourceNodes[i].active.meta.id, true,
                                            true);
+            w->optionalAllSoundsOffOnToggle();
             w->repaint();
         };
 
@@ -61,6 +67,9 @@ MixerPanel::MixerPanel(SixSinesEditor &e) : jcmp::NamedPanel("Mixer"), HasEditor
         panLabels[i] = std::make_unique<jcmp::Label>();
         panLabels[i]->setText("Pan");
         addAndMakeVisible(*panLabels[i]);
+
+        vuMeters[i] = std::make_unique<jcmp::VUMeter>(jcmp::VUMeter::VERTICAL);
+        addAndMakeVisible(*vuMeters[i]);
 
         sst::jucegui::component_adapters::setTraversalId(power[i].get(), i * 12 + 50);
         sst::jucegui::component_adapters::setTraversalId(solo[i].get(), i * 12 + 51);
@@ -83,6 +92,8 @@ void MixerPanel::resized()
         positionPowerKnobSwitchAndLabel(x, y, power[i], solo[i], knobs[i], labels[i]);
         solo[i]->setBounds(solo[i]->getBounds().reduced(4, 0).translated(0, -1));
         positionKnobAndLabel(x + uicPowerKnobWidth + uicMargin, y, panKnobs[i], panLabels[i]);
+        auto vuX = x + uicPowerKnobWidth + uicMargin + uicKnobSize + 2 * uicMargin;
+        vuMeters[i]->setBounds(vuX, y, 13, uicKnobSize);
         y += uicLabeledKnobHeight + uicMargin;
     }
 }

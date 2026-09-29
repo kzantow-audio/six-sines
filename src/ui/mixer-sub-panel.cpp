@@ -27,7 +27,7 @@ void MixerSubPanel::setSelectedIndex(int idx)
 
     removeAllChildren();
 
-    auto &sn = editor.patchCopy.mixerNodes[idx];
+    auto &sn = editor.patchMainRef.mixerNodes[idx];
     setupDAHDSR(editor, sn);
     setupLFO(editor, sn);
     setupModulation(editor, sn);
@@ -61,6 +61,10 @@ void MixerSubPanel::setSelectedIndex(int idx)
     addAndMakeVisible(*envMul);
     traverse(envMul);
 
+    createComponent(editor, *this, sn.lfoLevelMode, lfoMode, lfoModeD);
+    addAndMakeVisible(*lfoMode);
+    traverse(lfoMode);
+
     modLabelE = std::make_unique<jcmp::RuledLabel>();
     modLabelE->setText(std::string() + "Env" + u8"\U00002192");
     addAndMakeVisible(*modLabelE);
@@ -87,11 +91,10 @@ void MixerSubPanel::resized()
 {
     auto p = getLocalBounds().reduced(uicMargin, 0);
     auto pn = layoutDAHDSRAt(p.getX(), p.getY());
-    auto gh = (pn.getHeight() - 2 * uicPowerButtonSize) / 2;
     auto r = layoutLFOAt(pn.getX() + uicMargin, p.getY());
 
-    auto depx = r.getX() + uicMargin;
-    auto depy = r.getY();
+    auto depx = p.getX();
+    auto depy = std::min(pn.getBottom(), r.getBottom()) + uicMargin;
 
     namespace jlo = sst::jucegui::layouts;
     auto lo = jlo::HList().at(depx, depy).withAutoGap(uicMargin * 2);
@@ -102,10 +105,22 @@ void MixerSubPanel::resized()
     el.add(jlo::Component(*envMul).withHeight(2 * uicLabelHeight + uicMargin));
     lo.add(el);
 
-    auto ll = jlo::VList().withWidth(uicSubPanelColumnWidth).withAutoGap(uicMargin);
+    auto ll = jlo::VList().withWidth(2 * uicSubPanelColumnWidth + uicMargin).withAutoGap(uicMargin);
     ll.add(titleLabelGaplessLayout(modLabelL));
-    ll.add(labelKnobLayout(lfoToLevel, lfoToLevelL).centerInParent());
-    ll.add(labelKnobLayout(lfoToPan, lfoToPanL).centerInParent());
+
+    // Space the Pan knob a full column pitch from Level so it aligns to the second column.
+    auto kl = jlo::HList()
+                  .withHeight(uicLabeledKnobHeight)
+                  .withAutoGap(uicSubPanelColumnWidth - uicKnobSize);
+    kl.add(labelKnobLayout(lfoToLevel, lfoToLevelL).centerInParent());
+    kl.add(labelKnobLayout(lfoToPan, lfoToPanL).centerInParent());
+    ll.add(kl);
+
+    // mode switch sits under the level knob (left column only)
+    auto sl = jlo::HList().withHeight(3 * uicLabelHeight + uicMargin).withAutoGap(uicMargin);
+    sl.add(jlo::Component(*lfoMode).withWidth(uicSubPanelColumnWidth));
+    ll.add(sl);
+
     lo.add(ll);
 
     lo.doLayout();

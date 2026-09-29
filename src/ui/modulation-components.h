@@ -26,6 +26,14 @@
 namespace baconpaul::six_sines::ui
 {
 namespace jcmp = sst::jucegui::components;
+
+enum class SourceFilterResult
+{
+    Include,  // show normally
+    Exclude,  // omit from menu entirely
+    Disabled, // show greyed and unselectable
+};
+
 template <typename Comp, typename Patch> struct ModulationComponents
 {
     Comp *asComp() { return static_cast<Comp *>(this); }
@@ -39,7 +47,7 @@ template <typename Comp, typename Patch> struct ModulationComponents
         patchPtr = &v;
         auto c = asComp();
         modTitleLab = std::make_unique<jcmp::RuledLabel>();
-        modTitleLab->setText("Modulation");
+        modTitleLab->setText("Other Modulation");
         asComp()->addAndMakeVisible(*modTitleLab);
 
         for (int i = 0; i < numModsPer; ++i)
@@ -135,33 +143,29 @@ template <typename Comp, typename Patch> struct ModulationComponents
 
     void layoutModulation(const juce::Rectangle<int> &r)
     {
-        auto modW{uicModulationWidth};
-
         namespace jlo = sst::jucegui::layouts;
 
+        auto rowHeight = static_cast<int>(uicLabelHeight) + 4;
+        auto nMods = static_cast<int>(numModsPer);
+        auto totalHeight = static_cast<int>(uicTitleLabelHeight) + nMods * rowHeight +
+                           (nMods - 1) * static_cast<int>(uicMargin);
+
         auto lo = jlo::VList()
-                      .at(r.getRight() - uicModulationWidth, r.getY())
-                      .withHeight(asComp()->getHeight() - r.getY())
-                      .withWidth(uicModulationWidth);
+                      .at(r.getX(), r.getBottom() - totalHeight)
+                      .withWidth(r.getWidth())
+                      .withHeight(totalHeight);
 
         lo.add(titleLabelLayout(modTitleLab));
 
         for (int i = 0; i < numModsPer; ++i)
         {
-            auto hl = jlo::HList()
-                          .withWidth(uicModulationWidth)
-                          .withHeight(uicKnobSize)
-                          .withAutoGap(uicMargin);
-
-            auto vl = jlo::VList().expandToFill().withAutoGap(uicLabelGap);
-            vl.add(jlo::Component(*sourceMenu[i]).expandToFill());
-            vl.add(jlo::Component(*targetMenu[i]).expandToFill());
-
-            hl.add(vl);
-            hl.add(jlo::Component(*depthSlider[i]).withWidth(uicKnobSize));
-
+            auto hl = jlo::HList().withHeight(rowHeight).withAutoGap(uicMargin);
+            hl.add(jlo::Component(*sourceMenu[i]).expandToFill());
+            hl.add(jlo::Component(*targetMenu[i]).expandToFill());
+            hl.add(jlo::Component(*depthSlider[i]).expandToFill().insetBy(0, uicMargin));
             lo.add(hl);
-            lo.addGap(uicMargin * 2);
+            if (i < numModsPer - 1)
+                lo.addGap(uicMargin);
         }
 
         lo.doLayout();
@@ -175,6 +179,7 @@ template <typename Comp, typename Patch> struct ModulationComponents
         auto p = juce::PopupMenu();
         p.addSectionHeader("Modulation Target");
         p.addSeparator();
+        auto current = static_cast<int32_t>(std::round(patchPtr->modtarget[index].value));
         for (const auto &[id, nm] : patchPtr->targetList)
         {
             if (id == -1)
@@ -183,7 +188,9 @@ template <typename Comp, typename Patch> struct ModulationComponents
             }
             else
             {
-                p.addItem(nm,
+                auto ticked = (id == current);
+                auto enabled = isTargetAvailable(static_cast<typename Patch::TargetID>(id));
+                p.addItem(nm, enabled, ticked,
                           [si = id, w = juce::Component::SafePointer(asComp()), index]()
                           {
                               if (!w)
@@ -192,6 +199,8 @@ template <typename Comp, typename Patch> struct ModulationComponents
                                   return;
                               w->editor.setAndSendParamValue(w->patchPtr->modtarget[index], si);
                               w->resetTargetLabel(index);
+                              if (w->editor.onModulationRoutingChanged)
+                                  w->editor.onModulationRoutingChanged();
                           });
             }
         }
@@ -223,11 +232,23 @@ template <typename Comp, typename Patch> struct ModulationComponents
                     SXSNLOG("GenSet action at " << lidx << " with " << sCopy);
                 if (sCopy == 2048)
                     SXSNLOG("ERROR: GENSET with sCopy=2048 " << lidx);
+                // Selecting a MACRO_MOD_k source while macro k is off auto-powers it.
+                if (sCopy >= ModMatrixConfig::MACRO_MOD_0 &&
+                    sCopy < (int)ModMatrixConfig::MACRO_MOD_0 + (int)numMacros)
+                {
+                    int k = sCopy - (int)ModMatrixConfig::MACRO_MOD_0;
+                    auto &mp = w->editor.patchMainRef.macroNodes[k].macroPower;
+                    if (mp.value < 0.5f)
+                        w->editor.setAndSendParamValue(mp, 1.f);
+                }
                 w->editor.setAndSendParamValue(w->patchPtr->modsource[lidx], sCopy);
                 w->resetSourceLabel(lidx);
+                if (w->editor.onModulationRoutingChanged)
+                    w->editor.onModulationRoutingChanged();
             };
         };
 
+        auto currentSource = static_cast<int32_t>(std::round(patchPtr->modsource[index].value));
         for (const auto &so : asComp()->editor.modMatrixConfig.sources)
         {
             auto dname = so.name;
@@ -235,9 +256,18 @@ template <typename Comp, typename Patch> struct ModulationComponents
             if (debugLevel > 0)
                 dname += " (" + std::to_string(id) + ")";
 
+            auto filt = sourceFilter(static_cast<int>(id));
+            if (filt == SourceFilterResult::Exclude)
+                continue;
+            auto enabled = (filt != SourceFilterResult::Disabled);
+
+            auto ticked = (static_cast<int32_t>(id) == currentSource);
+
             if (so.group.empty())
             {
-                p.addItem(dname, genSet(id));
+                if (so.addSeparatorBefore)
+                    p.addSeparator();
+                p.addItem(dname, enabled, ticked, genSet(id));
             }
             else
             {
@@ -247,7 +277,9 @@ template <typename Comp, typename Patch> struct ModulationComponents
                     s = juce::PopupMenu();
                 }
                 currCat = so.group;
-                s.addItem(dname, genSet(id));
+                if (so.addSeparatorBefore)
+                    s.addSeparator();
+                s.addItem(dname, enabled, ticked, genSet(id));
             }
         }
         if (s.getNumItems() > 0)
@@ -262,8 +294,21 @@ template <typename Comp, typename Patch> struct ModulationComponents
 
     std::array<std::unique_ptr<jcmp::MenuButton>, numModsPer> sourceMenu;
     std::array<std::unique_ptr<jcmp::MenuButton>, numModsPer> targetMenu;
-    std::array<std::unique_ptr<jcmp::Knob>, numModsPer> depthSlider;
+    std::array<std::unique_ptr<jcmp::HSliderFilled>, numModsPer> depthSlider;
     std::array<std::unique_ptr<PatchContinuous>, numModsPer> depthSliderD;
+
+    // Override per-panel to grey out targets that don't apply to the current node state
+    // (e.g. EXTEND_M only available in PHASE_REMAP).
+    std::function<bool(typename Patch::TargetID)> isTargetAvailable{[](auto) { return true; }};
+
+    // Universal source filter. MACRO_MOD_k is always Include even when macro k
+    // is off; selecting it auto-powers the macro on (see genSet above). Panels
+    // overriding sourceFilter should fall through to this.
+    SourceFilterResult sharedSourceFilter(int /*sid*/) { return SourceFilterResult::Include; }
+
+    // Override per-panel to add extra rules; defaults to sharedSourceFilter.
+    std::function<SourceFilterResult(int)> sourceFilter{[this](int sid)
+                                                        { return sharedSourceFilter(sid); }};
 };
 } // namespace baconpaul::six_sines::ui
 #endif // MODULATION_COMPONENTS_H

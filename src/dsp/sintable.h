@@ -26,6 +26,17 @@
 
 namespace baconpaul::six_sines
 {
+namespace phase
+{
+// Six Sines uses a 26-bit phase: 14 bits of integer position (12 table + 2 quadrant)
+// plus 12 bits of fractional. The unit cycle spans [0, phaseMax).
+static constexpr uint32_t phaseBits = 26;
+static constexpr uint32_t phaseMax = 1u << phaseBits;
+static constexpr uint32_t phaseMask = phaseMax - 1;
+static constexpr uint32_t halfPhase = phaseMax >> 1;
+static constexpr float phaseMaxF = static_cast<float>(phaseMax);
+} // namespace phase
+
 struct SinTable
 {
     enum WaveForm
@@ -55,6 +66,23 @@ struct SinTable
         HALF_BLACKMAN_HARRIS_WINDOW,
         TUKEY_WINDOW,
 
+        // no table entry; OpSource reads a loaded Wavetable instead of quadrantTable
+        USER_TABLE,
+
+        // AUDIO_IN must stay last among the WaveForm values (just before NUM_WAVEFORMS).
+        // New synthesized waveforms should be inserted BEFORE this line, not after.
+        //
+        // Streaming convention: waveForm params stream as integer values, so adding a
+        // new waveform N at position N shifts nothing as long as existing values are
+        // unchanged. When you add new waveforms:
+        //   1. Insert them here before AUDIO_IN (they will get values 21, 22, ...)
+        //   2. AUDIO_IN's integer value will increase by however many you add
+        //   3. Bump the streaming version of SourceNode in patch.h and write a version
+        //      handler that maps the old AUDIO_IN value to the new one
+        //   4. Update waveformMenuBase in waveform-display.h with the new entries
+        //      (the static_assert there will catch this at compile time)
+        AUDIO_IN, // no table entry; bypassed in OpSource::renderBlock
+
         NUM_WAVEFORMS
     };
 
@@ -69,6 +97,39 @@ struct SinTable
     static SIMD_M128 simdFullQuad alignas(
         16)[NUM_WAVEFORMS][nQuadrants * nPoints];    // for each quad it is q, q+1, dq + 1
     static SIMD_M128 simdCubic alignas(16)[nPoints]; // it is cq, cq+1, cdq, cd1+1
+    /*
+     * (1, 0, 0, 0) at every fractional position: dotted against the same (v, dv, v+1, dv+1)
+     * vector it yields v, so a reader pointed here holds each sample instead of interpolating.
+     * Zero order hold as data rather than as a branch in the inner loop.
+     */
+    static SIMD_M128 simdZOH alignas(16)[nPoints];
+
+    // squarish, sawish and blackman harris with the slopes 1.2 shipped; the 1.2 dsp flag reads these
+    static SIMD_M128 simdLegacyQuad alignas(16)[3][nQuadrants * nPoints];
+    static SIMD_M128 *legacyQuad(WaveForm wf)
+    {
+        switch (wf)
+        {
+        case SQUARISH:
+            return simdLegacyQuad[0];
+        case SAWISH:
+            return simdLegacyQuad[1];
+        case BLACKMAN_HARRIS_WINDOW:
+            return simdLegacyQuad[2];
+        default:
+            return nullptr;
+        }
+    }
+    static SIMD_M128 *quadTable(WaveForm wf, bool legacy)
+    {
+        if (legacy)
+            if (auto *l = legacyQuad(wf))
+                return l;
+        return simdFullQuad[wf];
+    }
+    static void fillLegacyTable(WaveForm wf,
+                                std::function<std::pair<double, double>(double x, int Q)> der);
+
     static bool staticsInitialized;
 
     SIMD_M128 *simdQuad;
@@ -83,12 +144,25 @@ struct SinTable
     static void fillTable(int WF, std::function<std::pair<double, double>(double x, int Q)> der);
     static void initializeStatics();
 
-    void setWaveForm(WaveForm wf)
+    // plain loads, not prefetch hints: a linear walk trips the hardware stream prefetcher
+    static void touch(const void *p, size_t bytes)
+    {
+        auto *c = static_cast<const volatile uint8_t *>(p);
+        for (size_t i = 0; i < bytes; i += 64)
+            (void)c[i];
+    }
+    static void preloadWaveForm(WaveForm wf, bool legacy)
+    {
+        touch(quadTable(wf, legacy), sizeof(simdFullQuad[wf]));
+    }
+    static void preloadInterpolation() { touch(simdCubic, sizeof(simdCubic)); }
+
+    void setWaveForm(WaveForm wf, bool legacy = false)
     {
         auto stwf = size_t(wf);
         if (stwf >= NUM_WAVEFORMS) // mostly remove ine during dev
             stwf = 0;
-        simdQuad = simdFullQuad[stwf];
+        simdQuad = quadTable((WaveForm)stwf, legacy);
     }
 
     double frToPhase{0};

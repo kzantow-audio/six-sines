@@ -15,6 +15,7 @@
 
 #include "self-sub-panel.h"
 #include "patch-data-bindings.h"
+#include "dsp/sintable.h"
 
 namespace baconpaul::six_sines::ui
 {
@@ -27,10 +28,10 @@ void SelfSubPanel::setSelectedIndex(int idx)
 
     removeAllChildren();
 
-    auto &n = editor.patchCopy.selfNodes[idx];
-    setupDAHDSR(editor, editor.patchCopy.selfNodes[idx]);
-    setupLFO(editor, editor.patchCopy.selfNodes[idx]);
-    setupModulation(editor, editor.patchCopy.selfNodes[idx]);
+    auto &n = editor.patchMainRef.selfNodes[idx];
+    setupDAHDSR(editor, editor.patchMainRef.selfNodes[idx]);
+    setupLFO(editor, editor.patchMainRef.selfNodes[idx]);
+    setupModulation(editor, editor.patchMainRef.selfNodes[idx]);
 
     auto travidx{400};
     auto traverse = [&travidx](auto &c)
@@ -53,6 +54,10 @@ void SelfSubPanel::setSelectedIndex(int idx)
     createComponent(editor, *this, n.envIsMultiplcative, envMul, envMulD);
     addAndMakeVisible(*envMul);
     traverse(envMul);
+
+    createComponent(editor, *this, n.lfoFBMode, lfoMode, lfoModeD);
+    addAndMakeVisible(*lfoMode);
+    traverse(lfoMode);
 
     modLabelE = std::make_unique<jcmp::RuledLabel>();
     modLabelE->setText(std::string() + "Env" + u8"\U00002192");
@@ -87,12 +92,11 @@ void SelfSubPanel::resized()
 {
     auto p = getLocalBounds().reduced(uicMargin, 0);
     auto pn = layoutDAHDSRAt(p.getX(), p.getY());
-    auto gh = (pn.getHeight() - 2 * uicPowerButtonSize) / 2;
     pn = pn.translated(uicMargin, 0);
     auto r = layoutLFOAt(pn.getX(), p.getY());
 
-    auto depx = r.getX() + uicMargin;
-    auto depy = r.getY();
+    auto depx = p.getX();
+    auto depy = std::min(pn.getBottom(), r.getBottom()) + uicMargin;
 
     namespace jlo = sst::jucegui::layouts;
     auto lo = jlo::HList().at(depx, depy).withAutoGap(uicMargin * 2);
@@ -106,6 +110,11 @@ void SelfSubPanel::resized()
     auto ll = jlo::VList().withWidth(uicSubPanelColumnWidth).withAutoGap(uicMargin);
     ll.add(titleLabelGaplessLayout(modLabelL));
     ll.add(labelKnobLayout(lfoToFb, lfoToFbL).centerInParent());
+
+    auto sl = jlo::HList().withHeight(3 * uicLabelHeight + uicMargin).withAutoGap(uicMargin);
+    sl.add(jlo::Component(*lfoMode).withWidth(uicSubPanelColumnWidth));
+    ll.add(sl);
+
     lo.add(ll);
 
     auto od = jlo::VList().withWidth(uicSubPanelColumnWidth).withAutoGap(uicMargin);
@@ -119,10 +128,37 @@ void SelfSubPanel::resized()
 
 void SelfSubPanel::setEnabledState()
 {
+    // When op1 (index 0) is in AUDIO_IN mode, feedback is skipped — grey everything out
+    auto isAudioIn =
+        (index == 0) &&
+        ((int)std::round(editor.patchMainRef.sourceNodes[0].waveForm.value) == SinTable::AUDIO_IN);
+
     auto en = envMulD->getValue() < 0.5;
-    envToLev->setEnabled(en);
-    envToLevL->setEnabled(en);
+    envToLev->setEnabled(en && !isAudioIn);
+    envToLevL->setEnabled(en && !isAudioIn);
+    lfoToFb->setEnabled(!isAudioIn);
+    lfoToFbL->setEnabled(!isAudioIn);
+    overdrive->setEnabled(!isAudioIn);
+    envMul->setEnabled(!isAudioIn);
+
+    // DAHDSR envelope controls
+    for (int i = 0; i < DAHDSRComponents::nels; ++i)
+        slider[i]->setEnabled(!isAudioIn);
+    for (int i = 0; i < DAHDSRComponents::nShape; ++i)
+        shapes[i]->setEnabled(!isAudioIn);
+    triggerButton->setEnabled(!isAudioIn);
+
+    // LFO controls
+    rate->setEnabled(!isAudioIn);
+    deform->setEnabled(!isAudioIn);
+    phase->setEnabled(!isAudioIn);
+    shape->setEnabled(!isAudioIn);
+    tempoSync->setEnabled(!isAudioIn);
+    bipolar->setEnabled(!isAudioIn);
+    isEnv->setEnabled(!isAudioIn);
+
     repaint();
+    editor.repaint();
 }
 
 IMPLEMENTS_CLIPBOARD_SUPPORT(SelfSubPanel, selfNodes[index],

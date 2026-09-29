@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.28)
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-set(CMAKE_OSX_DEPLOYMENT_TARGET 10.14 CACHE STRING "Build for 10.14")
+set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0 CACHE STRING "Build for 10.14")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 
-project(six-sines VERSION 1.1.0.0 LANGUAGES C CXX)
+project(six-sines VERSION 1.2.0 LANGUAGES C CXX)
 set(PRODUCT_NAME "Six Sines")
 
 
@@ -25,6 +25,19 @@ include(cmake/CmakeRC.cmake)
 file(GLOB_RECURSE PATCHES  "resources/factory_patches/*.sxsnp")
 cmrc_add_resource_library(${PROJECT_NAME}-patches NAMESPACE sixsines_patches ${PATCHES})
 
+file(GLOB THEMES "resources/factory_themes/*.sixtheme")
+cmrc_add_resource_library(${PROJECT_NAME}-themes NAMESPACE sixsines_themes ${THEMES})
+
+file(GLOB FONTS
+        "resources/fonts/Manrope/static/*.ttf"
+        "resources/fonts/Anonymous_Pro/*.ttf")
+# The fonts library also carries the about-screen assets (icon + acknowledgements)
+# so we don't need a separate cmrc target for two files.
+cmrc_add_resource_library(${PROJECT_NAME}-fonts NAMESPACE sixsines_fonts
+        ${FONTS}
+        resources/icon/SixSinesIcon.png
+        doc/ack.md)
+
 set(JUCE_PATH "${CMAKE_SOURCE_DIR}/libs/JUCE")
 add_subdirectory(libs)
 
@@ -34,6 +47,8 @@ add_library(${PROJECT_NAME}-impl STATIC
         src/clap/preset-discovery-impl.cpp
 
         src/ui/six-sines-editor.cpp
+        src/ui/about-screen.cpp
+        src/ui/spectrum-analyzer.cpp
 
         src/ui/clipboard.cpp
         src/ui/main-panel.cpp
@@ -45,19 +60,26 @@ add_library(${PROJECT_NAME}-impl STATIC
         src/ui/mixer-sub-panel.cpp
         src/ui/source-panel.cpp
         src/ui/source-sub-panel.cpp
+        src/ui/segmented-ratio-editor.cpp
         src/ui/macro-panel.cpp
+        src/ui/macro-sub-panel.cpp
         src/ui/finetune-sub-panel.cpp
         src/ui/mainpan-sub-panel.cpp
         src/ui/playmode-sub-panel.cpp
+        src/ui/settings-panel.cpp
 
         src/presets/preset-manager.cpp
+        src/presets/ui-theme-manager.cpp
 
         src/dsp/sintable.cpp
+        src/dsp/wavetable_build.cpp
+        src/dsp/wavetable_io.cpp
 
         src/synth/synth.cpp
         src/synth/voice.cpp
         src/synth/patch.cpp
         src/synth/mod_matrix.cpp
+        src/synth/macro_usage.cpp
 
 )
 target_include_directories(${PROJECT_NAME}-impl PUBLIC src)
@@ -80,7 +102,7 @@ endif()
 target_link_libraries(${PROJECT_NAME}-impl PUBLIC
         clap
 )
-target_link_libraries(${PROJECT_NAME}-impl PRIVATE
+target_link_libraries(${PROJECT_NAME}-impl PUBLIC  # PW change to public since we now have tests
         simde
         clap-helpers clap-wrapper-extensions
         mts-esp-client
@@ -91,11 +113,19 @@ target_link_libraries(${PROJECT_NAME}-impl PRIVATE
         sst-plugininfra::tinyxml
         sst-plugininfra::strnatcmp
         sst-plugininfra::patchbase
+        sst-plugininfra::miniz
+        pffft
         sst-plugininfra::version_information
+        sst-filters
         sst::clap_juce_shim sst::clap_juce_shim_headers
+        juce::juce_dsp
         ${PROJECT_NAME}-patches
+        ${PROJECT_NAME}-themes
+        ${PROJECT_NAME}-fonts
         samplerate
 )
+
+target_compile_definitions(clap-wrapper-compile-options-public INTERFACE CLAP_WRAPPER_LOGLEVEL=0)
 
 make_clapfirst_plugins(
         TARGET_NAME ${PROJECT_NAME}
@@ -114,14 +144,34 @@ make_clapfirst_plugins(
 
         ASSET_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_assets
 
+        WINDOWS_FOLDER_VST3 TRUE
+
         # You can add a target-per-standalone you want. Syntax here is
         #   target-postfix output-name clap-id
         # This allows you to make multiple standalones from a multi-plugin clap
         STANDALONE_CONFIGURATIONS
             standalone "${PRODUCT_NAME}" "org.baconpaul.six-sines"
 
-        STANDALONE_MACOS_ICON "${CMAKE_SOURCE_DIR}/resources/mac_installer/Icon.icns"
+        STANDALONE_MACOS_ICON "${CMAKE_SOURCE_DIR}/resources/installer_mac/SixSinesIcon.icns"
+        STANDALONE_WINDOWS_ICON "${CMAKE_SOURCE_DIR}/resources/icon/SixSinesIcon.ico"
 )
+
+
+include(cmake/basic_installer_clapfirst.cmake)
+add_clapfirst_installer(
+        INSTALLER_TARGET ${PROJECT_NAME}-installer
+        ASSET_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_assets
+        INSTALLER_PREFIX "six-sines"
+        PRODUCT_NAME "${PRODUCT_NAME}"
+        TARGETS
+        ${PROJECT_NAME}_clap
+        ${PROJECT_NAME}_vst3
+        ${PROJECT_NAME}_auv2
+        ${PROJECT_NAME}_standalone
+)
+
+add_subdirectory(tests EXCLUDE_FROM_ALL)
+
 
 
 

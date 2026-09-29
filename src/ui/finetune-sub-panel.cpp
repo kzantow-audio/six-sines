@@ -21,7 +21,7 @@ namespace baconpaul::six_sines::ui
 {
 FineTuneSubPanel::FineTuneSubPanel(SixSinesEditor &e) : HasEditor(e)
 {
-    auto &on = editor.patchCopy.fineTuneMod;
+    auto &on = editor.patchMainRef.fineTuneMod;
     setupDAHDSR(e, on);
     setupModulation(e, on);
     setupLFO(e, on);
@@ -75,11 +75,18 @@ FineTuneSubPanel::FineTuneSubPanel(SixSinesEditor &e) : HasEditor(e)
     addAndMakeVisible(*coarse);
     addAndMakeVisible(*coarseL);
 
-    createComponent(editor, *this, editor.patchCopy.output.fineTune, fine, fineD);
+    createComponent(editor, *this, editor.patchMainRef.output.fineTune, fine, fineD);
     fineL = std::make_unique<jcmp::Label>();
     fineL->setText("Fine");
     addAndMakeVisible(*fine);
     addAndMakeVisible(*fineL);
+
+    fineD->onGuiSetValue = [w = juce::Component::SafePointer(this)]()
+    {
+        if (!w)
+            return;
+        w->editor.mainPanel->repaint();
+    };
 
     resized();
     repaint();
@@ -89,37 +96,32 @@ void FineTuneSubPanel::resized()
 {
     auto p = getLocalBounds().reduced(uicMargin, 0);
     auto pn = layoutDAHDSRAt(p.getX(), p.getY());
-    auto gh = (pn.getHeight() - 2 * uicPowerButtonSize) / 2;
     auto r = layoutLFOAt(pn.getX() + uicMargin, p.getY());
 
-    auto depx = r.getX() + uicMargin;
-    auto depy = r.getY();
+    auto depx = p.getX();
+    auto depy = std::min(pn.getBottom(), r.getBottom()) + uicMargin;
 
     namespace jlo = sst::jucegui::layouts;
-    auto lo = jlo::HList().at(depx, depy).withAutoGap(uicMargin * 2);
+    auto lo =
+        jlo::VList().at(depx, depy).withWidth(uicKnobSize * 2 + uicMargin).withAutoGap(uicMargin);
 
-    auto cel = jlo::VList().withWidth(uicSubPanelColumnWidth).withAutoGap(uicMargin);
-    cel.add(titleLabelGaplessLayout(tuneTitle));
-    cel.add(labelKnobLayout(fine, fineL).centerInParent());
-    cel.add(labelKnobLayout(coarse, coarseL).centerInParent());
-    lo.add(cel);
+    lo.add(titleLabelGaplessLayout(tuneTitle));
+    auto tk = jlo::HList().withHeight(uicLabeledKnobHeight).withAutoGap(uicMargin);
+    tk.add(labelKnobLayout(fine, fineL).centerInParent());
+    tk.add(labelKnobLayout(coarse, coarseL).centerInParent());
+    lo.add(tk);
 
-    auto kl = jlo::VList().withWidth(uicKnobSize * 2 + uicMargin * 2).withAutoGap(uicMargin);
-    kl.add(titleLabelGaplessLayout(envTitle));
+    lo.add(titleLabelGaplessLayout(envTitle));
+    auto ek = jlo::HList().withHeight(uicLabeledKnobHeight).withAutoGap(uicMargin);
+    ek.add(labelKnobLayout(envDepth, envDepthLL).centerInParent());
+    ek.add(labelKnobLayout(envCDepth, envCDepthLL).centerInParent());
+    lo.add(ek);
 
-    auto hl = jlo::HList().withAutoGap(uicMargin).withHeight(uicLabeledKnobHeight);
-    hl.add(labelKnobLayout(envDepth, envDepthLL));
-    hl.add(labelKnobLayout(envCDepth, envCDepthLL));
-    kl.add(hl);
-
-    kl.add(titleLabelGaplessLayout(lfoTitle));
-
-    hl = jlo::HList().withAutoGap(uicMargin).withHeight(uicLabeledKnobHeight);
-    hl.add(labelKnobLayout(lfoDep, lfoDepL));
-    hl.add(labelKnobLayout(lfoCDep, lfoCDepL));
-    kl.add(hl);
-
-    lo.add(kl);
+    lo.add(titleLabelGaplessLayout(lfoTitle));
+    auto lk = jlo::HList().withHeight(uicLabeledKnobHeight).withAutoGap(uicMargin);
+    lk.add(labelKnobLayout(lfoDep, lfoDepL).centerInParent());
+    lk.add(labelKnobLayout(lfoCDep, lfoCDepL).centerInParent());
+    lo.add(lk);
 
     lo.doLayout();
 

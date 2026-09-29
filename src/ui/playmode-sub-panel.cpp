@@ -14,13 +14,90 @@
  */
 
 #include "playmode-sub-panel.h"
+#include "filesystem/import.h"
+#include <cstdio>
 #include <sst/jucegui/layouts/ListLayout.h>
+#include "libMTSClient.h"
 
 namespace baconpaul::six_sines::ui
 {
+// A JogUpDownButton whose arrows / wheel step through a fixed set of values rather than
+// every integer in the range. The popup menu is delegated to onShowPopup so the host panel
+// can present just those choices.
+struct SteppedJogButton : jcmp::JogUpDownButton
+{
+    std::vector<int> steps;
+    std::function<void(const juce::ModifierKeys &)> onShowPopup{nullptr};
+
+    int steppedJog(int cur, int dir) const
+    {
+        if (steps.empty())
+            return cur;
+        if (dir > 0)
+        {
+            for (auto s : steps)
+                if (s > cur)
+                    return s;
+            return steps.back();
+        }
+        for (auto it = steps.rbegin(); it != steps.rend(); ++it)
+            if (*it < cur)
+                return *it;
+        return steps.front();
+    }
+
+    void applyJog(int dir)
+    {
+        if (!data)
+            return;
+        onBeginEdit();
+        data->setValueFromGUI(steppedJog(data->getValue(), dir));
+        repaint();
+        onEndEdit();
+    }
+
+    void mouseUp(const juce::MouseEvent &e) override
+    {
+        if (e.mods.isPopupMenu())
+            return;
+        int dir = 0;
+        if (leftButtonBound().contains(e.position.toInt()))
+            dir = -1;
+        if (rightButtonBound().contains(e.position.toInt()))
+            dir = 1;
+        if (dir != 0)
+            applyJog(dir);
+    }
+
+    void mouseWheelMove(const juce::MouseEvent &, const juce::MouseWheelDetails &w) override
+    {
+        auto thresh = 0.05;
+        wheel0 += w.deltaY;
+        if (wheel0 > thresh)
+        {
+            applyJog(-1);
+            wheel0 = 0;
+        }
+        if (wheel0 < -thresh)
+        {
+            applyJog(1);
+            wheel0 = 0;
+        }
+        onWheelEditOccurred();
+    }
+
+    void showPopup(const juce::ModifierKeys &m) override
+    {
+        if (onShowPopup)
+            onShowPopup(m);
+    }
+};
+
+PlayModeSubPanel::~PlayModeSubPanel() = default;
+
 PlayModeSubPanel::PlayModeSubPanel(SixSinesEditor &e) : HasEditor(e)
 {
-    auto &on = editor.patchCopy.output;
+    auto &on = editor.patchMainRef.output;
 
     createComponent(editor, *this, on.bendUp, bUp, bUpD);
     createComponent(editor, *this, on.bendDown, bDn, bDnD);
@@ -119,7 +196,7 @@ PlayModeSubPanel::PlayModeSubPanel(SixSinesEditor &e) : HasEditor(e)
     uniRPhase->setLabel("Rand Phase");
     addAndMakeVisible(*uniRPhase);
 
-    createComponent(editor, *this, on.unisonSpread, uniSpread, uniSpreadD);
+    createRescaledComponent(editor, *this, on.unisonSpread, uniSpread, uniSpreadD);
     addAndMakeVisible(*uniSpread);
     uniSpreadG = std::make_unique<jcmp::GlyphPainter>(jcmp::GlyphPainter::TUNING);
     addAndMakeVisible(*uniSpreadG);
@@ -134,22 +211,151 @@ PlayModeSubPanel::PlayModeSubPanel(SixSinesEditor &e) : HasEditor(e)
     addAndMakeVisible(*uniTitle);
     editor.componentRefreshByID[on.unisonCount.meta.id] = op;
 
-    mpeTitle = std::make_unique<jcmp::RuledLabel>();
-    mpeTitle->setText("MPE");
-    addAndMakeVisible(*mpeTitle);
+    smoothingSectionTitle = std::make_unique<jcmp::RuledLabel>();
+    smoothingSectionTitle->setText("MPE + Smoothing");
+    smoothingSectionTitle->hasHamburger = true;
+    smoothingSectionTitle->onHamburger = [w = juce::Component::SafePointer(this)]()
+    {
+        if (w)
+            w->showSmoothingDefaultsMenu();
+    };
+    addAndMakeVisible(*smoothingSectionTitle);
 
-    createComponent(editor, *this, on.mpeActive, mpeActiveButton, mpeActiveButtonD);
-    addAndMakeVisible(*mpeActiveButton);
-    mpeActiveButton->setLabel("MPE Active");
-    mpeActiveButtonD->onGuiSetValue = op;
-    editor.componentRefreshByID[on.mpeActive.meta.id] = op;
+    mpeRowLabel = std::make_unique<jcmp::Label>();
+    mpeRowLabel->setText("MPE");
+    mpeRowLabel->setJustification(juce::Justification::centredRight);
+    addAndMakeVisible(*mpeRowLabel);
 
-    createComponent(editor, *this, on.mpeBendRange, mpeRange, mpeRangeD);
-    addAndMakeVisible(*mpeRange);
+    mpeActiveButtonD = std::make_unique<decltype(mpeActiveButtonD)::element_type>(
+        editor.dawStateMainRef.audio.mpeActive);
+    mpeActiveButtonD->setLabel("MPE Active");
+    mpeActiveButtonD->widget->setLabel("Active");
+    mpeActiveButtonD->onValueChanged = [w = juce::Component::SafePointer(this), op](bool v)
+    {
+        if (!w)
+            return;
+        // The toggle wrote dawStateMainRef.audio.mpeActive directly (bound by reference); ship the
+        // audio-relevant session state to the audio thread.
+        w->editor.pushAudioDawState();
+        op();
+    };
+    addAndMakeVisible(*mpeActiveButtonD->widget);
+
+    mpeRangeEditor = std::make_unique<jcmp::TextEditor>();
+    mpeRangeEditor->setMultiLine(false);
+    mpeRangeEditor->setReturnKeyStartsNewLine(false);
+    mpeRangeEditor->setJustification(juce::Justification::centred);
+    mpeRangeEditor->setIndents(3, 1);
+    mpeRangeEditor->setInputRestrictions(3, "0123456789");
+    mpeRangeEditor->setTitle("MPE Bend Range");
+    mpeRangeEditor->onReturnKey = [w = juce::Component::SafePointer(this)]()
+    {
+        if (w)
+            w->commitMpeRangeEditor();
+    };
+    mpeRangeEditor->onFocusLost = [w = juce::Component::SafePointer(this)]()
+    {
+        if (w)
+            w->commitMpeRangeEditor();
+    };
+    refreshMpeRangeEditor();
+    addAndMakeVisible(*mpeRangeEditor);
+
+    // Refresh widget visuals + dependent enabled-state when the session state changes (a load
+    // bumps uiForceRebuild, whose rebuild calls applyDawExtraState -> these listeners).
+    editor.dawExtraStateRefreshListeners.push_back(
+        [w = juce::Component::SafePointer(this)]()
+        {
+            if (!w)
+                return;
+            if (w->mpeActiveButtonD && w->mpeActiveButtonD->widget)
+                w->mpeActiveButtonD->widget->repaint();
+            w->refreshMpeRangeEditor();
+            if (w->midiSmoothingSliderD && w->midiSmoothingSliderD->widget)
+                w->midiSmoothingSliderD->widget->repaint();
+            if (w->paramSmoothingSliderD && w->paramSmoothingSliderD->widget)
+                w->paramSmoothingSliderD->widget->repaint();
+            w->setEnabledState();
+        });
 
     mpeRangeL = std::make_unique<jcmp::Label>();
     mpeRangeL->setText("Bend");
+    mpeRangeL->setJustification(juce::Justification::centredRight);
     addAndMakeVisible(*mpeRangeL);
+
+    // Builds a smoothing slider bound to a float in dawStateMainRef.audio. The slider is a real
+    // HSliderFilled (fill + RMB value typein + set-to-default) reading/writing the float; every
+    // GUI change ships the audio-relevant session state to the audio thread by value.
+    auto makeSmoothingSlider =
+        [this](std::unique_ptr<sst::jucegui::component_adapters::ContinuousToValueReference<
+                   jcmp::HSliderFilled>> &slot,
+               float &under, float mx, float def, const std::string &label)
+    {
+        slot = std::make_unique<typename std::decay_t<decltype(slot)>::element_type>(under);
+        slot->setLabel(label);
+        slot->setRange(0.f, mx, def);
+        slot->valueToString = [](float v)
+        {
+            char b[32];
+            if (v == (int)v)
+                snprintf(b, sizeof(b), "%d ms", (int)v);
+            else
+                snprintf(b, sizeof(b), "%.1f ms", v);
+            return std::string(b);
+        };
+        auto *wid = slot->widget.get();
+        jdat::Continuous *src = slot.get();
+        slot->onValueChanged = [w = juce::Component::SafePointer(this), src](float v)
+        {
+            if (!w)
+                return;
+            // The slider wrote the bound float in dawStateMainRef.audio; ship the whole audio
+            // state.
+            w->editor.pushAudioDawState();
+            // Keep the live tooltip in sync while dragging.
+            w->editor.updateTooltip(src);
+        };
+        wid->onPopupMenu = [w = juce::Component::SafePointer(this), wid](const juce::ModifierKeys &)
+        {
+            if (w)
+                w->editor.popupMenuForContinuous(wid);
+        };
+        // Tooltip plumbing, mirroring createComponent: show on hover/drag, hide when done.
+        auto showTip = [w = juce::Component::SafePointer(this), wid, src]()
+        {
+            if (!w)
+                return;
+            w->editor.updateTooltip(src);
+            w->editor.showTooltipOn(wid);
+        };
+        auto hideTip = [w = juce::Component::SafePointer(this)]()
+        {
+            if (w)
+                w->editor.hideTooltip();
+        };
+        wid->onIdleHover = showTip;
+        wid->onBeginEdit = showTip;
+        wid->onIdleHoverEnd = hideTip;
+        wid->onEndEdit = hideTip;
+        addAndMakeVisible(*wid);
+    };
+
+    smoothingRowLabel = std::make_unique<jcmp::Label>();
+    smoothingRowLabel->setText("MIDI Smoothing");
+    smoothingRowLabel->setJustification(juce::Justification::centredRight);
+    addAndMakeVisible(*smoothingRowLabel);
+
+    makeSmoothingSlider(midiSmoothingSliderD, editor.dawStateMainRef.audio.midiCCSmoothingTimeMs,
+                        100.f, 25.f, "MIDI Smoothing");
+
+    paramSmoothingRowLabel = std::make_unique<jcmp::Label>();
+    paramSmoothingRowLabel->setText("Param Smoothing");
+    paramSmoothingRowLabel->setJustification(juce::Justification::centredRight);
+    addAndMakeVisible(*paramSmoothingRowLabel);
+
+    makeSmoothingSlider(paramSmoothingSliderD,
+                        editor.dawStateMainRef.audio.paramAutomationSmoothingTimeMs, 25.f, 2.f,
+                        "Param Smoothing");
 
     tsposeTitle = std::make_unique<jcmp::RuledLabel>();
     tsposeTitle->setText("Octave");
@@ -161,19 +367,23 @@ PlayModeSubPanel::PlayModeSubPanel(SixSinesEditor &e) : HasEditor(e)
     voiceLimitL = std::make_unique<jcmp::RuledLabel>();
     voiceLimitL->setText("Voices");
     addAndMakeVisible(*voiceLimitL);
-    voiceLimit = std::make_unique<jcmp::MenuButton>();
-    voiceLimit->setLabelAndTitle(std::to_string(getPolyLimit()),
-                                 "Voice Limit " + std::to_string(getPolyLimit()));
-    voiceLimit->setOnCallback([this]() { showPolyLimitMenu(); });
-    editor.componentRefreshByID[editor.patchCopy.output.polyLimit.meta.id] =
-        [w = juce::Component::SafePointer(this)]()
+    createComponent(editor, *this, on.polyLimit, voiceLimit, voiceLimitD);
+    voiceLimit->steps = {4, 6, 8, 12, 16, 24, 32, 48, 64};
+    voiceLimit->onShowPopup = [w = juce::Component::SafePointer(this)](const juce::ModifierKeys &)
     {
-        if (!w)
-            return;
-        w->voiceLimit->setLabelAndTitle(std::to_string(w->getPolyLimit()),
-                                        "Voice Limit " + std::to_string(w->getPolyLimit()));
+        if (w)
+            w->showPolyLimitMenu();
     };
     addAndMakeVisible(*voiceLimit);
+
+    mtsTitle = std::make_unique<jcmp::RuledLabel>();
+    mtsTitle->setText("MTS");
+    addAndMakeVisible(*mtsTitle);
+    mtsStatusLabel = std::make_unique<jcmp::Label>();
+    mtsStatusLabel->setText("No MTS");
+    mtsStatusLabel->setJustification(juce::Justification::centred);
+    mtsStatusLabel->setEnabled(false);
+    addAndMakeVisible(*mtsStatusLabel);
 
     panicTitle = std::make_unique<jcmp::RuledLabel>();
     panicTitle->setText("Panic");
@@ -184,13 +394,117 @@ PlayModeSubPanel::PlayModeSubPanel(SixSinesEditor &e) : HasEditor(e)
     addAndMakeVisible(*panicButton);
     addAndMakeVisible(*panicTitle);
 
-    createComponent(editor, *this, editor.patchCopy.output.sampleRateStrategy, srStrat, srStratD);
+    outputControlTitle = std::make_unique<jcmp::RuledLabel>();
+    outputControlTitle->setText("Output Stage (Main)");
+    addAndMakeVisible(*outputControlTitle);
+
+    auto &out = editor.patchMainRef.output;
+    createComponent(editor, *this, out.sampleRateStrategy, srStrat, srStratD);
     addAndMakeVisible(*srStrat);
-    createComponent(editor, *this, editor.patchCopy.output.resampleEngine, rsEng, rsEngD);
+    createComponent(editor, *this, out.resampleEngine, rsEng, rsEngD);
     addAndMakeVisible(*rsEng);
-    srStratLab = std::make_unique<jcmp::RuledLabel>();
-    srStratLab->setText("Oversampling");
-    addAndMakeVisible(*srStratLab);
+
+    createComponent(editor, *this, out.saturationType, satType, satTypeD);
+    addAndMakeVisible(*satType);
+    createComponent(editor, *this, out.saturationDrive, satDrive, satDriveD);
+    addAndMakeVisible(*satDrive);
+    createComponent(editor, *this, out.lowpass, lowpass, lowpassD);
+    addAndMakeVisible(*lowpass);
+    createComponent(editor, *this, out.bitRateAdjust, bitRate, bitRateD);
+    addAndMakeVisible(*bitRate);
+    createComponent(editor, *this, out.zohPreFilter, zohPreFilter, zohPreFilterD);
+    zohPreFilter->setDrawMode(jcmp::ToggleButton::DrawMode::GLYPH);
+    zohPreFilter->setGlyph(jcmp::GlyphPainter::POWER);
+    addAndMakeVisible(*zohPreFilter);
+    // Pre-Filter only applies when a ZOH rate is selected; grey it out otherwise.
+    editor.componentRefreshByID[out.bitRateAdjust.meta.id] = op;
+    bitRateD->onGuiSetValue = op;
+    createComponent(editor, *this, out.bitDepthAdjust, bitDepth, bitDepthD);
+    addAndMakeVisible(*bitDepth);
+    createComponent(editor, *this, out.highpass, highpass, highpassD);
+    addAndMakeVisible(*highpass);
+    createComponent(editor, *this, out.outputGain, outGain, outGainD);
+    addAndMakeVisible(*outGain);
+
+    createComponent(editor, *this, out.ultrasonicFilter, ultrasonicFilter, ultrasonicFilterD);
+    ultrasonicFilter->setDrawMode(jcmp::ToggleButton::DrawMode::LABELED);
+    addAndMakeVisible(*ultrasonicFilter);
+    setUltrasonicLabel();
+    // The toggle text shows the host Nyquist, so refresh it when the rate changes.
+    editor.onSampleRateChanged.push_back(
+        [w = juce::Component::SafePointer(this)]()
+        {
+            if (w)
+                w->setUltrasonicLabel();
+        });
+
+    createComponent(editor, *this, out.legacyDsp, legacyOutputDsp, legacyOutputDspD);
+    legacyOutputDsp->setDrawMode(jcmp::ToggleButton::DrawMode::LABELED);
+    legacyOutputDsp->setLabel("<= 1.2 dsp");
+    addAndMakeVisible(*legacyOutputDsp);
+
+    auto mkLabel = [this](auto &slot, const std::string &t,
+                          juce::Justification j = juce::Justification::centredRight)
+    {
+        slot = std::make_unique<jcmp::Label>();
+        slot->setText(t);
+        slot->setJustification(j);
+        addAndMakeVisible(*slot);
+    };
+    mkLabel(sampleRateLabel, "Sample Rate:");
+    mkLabel(ultrasonicLabel, "Ultrasonic Filter:");
+    mkLabel(saturationLabel, "Saturation:");
+    mkLabel(lowpassLabel, "Low Pass:");
+    mkLabel(bitRateLabel, "Sample Rate ZOH:");
+    mkLabel(zohPreFilterLabel, "Pre-Filter", juce::Justification::centredLeft);
+    mkLabel(bitDepthLabel, "Bit Depth:");
+    mkLabel(highpassLabel, "High Pass:");
+    mkLabel(outGainLabel, "Output:");
+    mkLabel(downsamplerLabel, "Downsampler:");
+
+    uiSectionTitle = std::make_unique<jcmp::RuledLabel>();
+    uiSectionTitle->setText("User Interface");
+    addAndMakeVisible(*uiSectionTitle);
+
+    mkLabel(zoomLabel, "Zoom:");
+    mkLabel(themeLabel, "Theme:");
+
+    zoomButton = std::make_unique<jcmp::TextPushButton>();
+    zoomButton->setOnCallback(
+        [w = juce::Component::SafePointer(this)]()
+        {
+            if (w)
+                w->showZoomMenu();
+        });
+    setZoomButtonLabel();
+    addAndMakeVisible(*zoomButton);
+
+    themeButton = std::make_unique<jcmp::TextPushButton>();
+    themeButton->setOnCallback(
+        [w = juce::Component::SafePointer(this)]()
+        {
+            if (w)
+                w->showThemeMenu();
+        });
+    setThemeButtonLabel();
+    addAndMakeVisible(*themeButton);
+
+    editThemeButton = std::make_unique<jcmp::TextPushButton>();
+    editThemeButton->setLabel("Edit");
+    editThemeButton->setOnCallback(
+        [w = juce::Component::SafePointer(this)]()
+        {
+            if (!w)
+                return;
+            auto &ed = w->editor;
+            if (ed.colorEditorWindow && ed.colorEditorWindow->isVisible())
+            {
+                ed.colorEditorWindow->toFront(true);
+                return;
+            }
+            ed.openColorEditor();
+        });
+    addAndMakeVisible(*editThemeButton);
 
     setEnabledState();
 }
@@ -198,68 +512,181 @@ PlayModeSubPanel::PlayModeSubPanel(SixSinesEditor &e) : HasEditor(e)
 void PlayModeSubPanel::resized()
 {
     namespace jlo = sst::jucegui::layouts;
-    auto lo = jlo::HList().at(uicMargin, 0).withAutoGap(2 * uicMargin);
-
-    // Voice Bend and Octave
     auto skinny = uicKnobSize + 30;
-    auto vbol = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
 
-    vbol.add(titleLabelGaplessLayout(voiceLimitL));
-    vbol.add(jlo::Component(*voiceLimit).withHeight(uicLabelHeight));
-    vbol.add(titleLabelGaplessLayout(bendTitle));
+    // Top section: 4 columns, each split into a top sub-section and a bottom sub-section
+    //   col1: Voices / Unison
+    //   col2: Play (mode + triggers + porta)
+    //   col3: Bend / Octave
+    //   col4: MTS / Panic
+    // The two tallest columns (1 and 2) drive the row height.
+    auto topRowHeight = uicTitleLabelInnerBox + 7 * uicLabelHeight + 7 * uicMargin;
 
-    vbol.add(sideLabel(bUpL, bUp));
-    vbol.add(sideLabel(bDnL, bDn));
+    auto outer = jlo::VList().at(uicMargin, 0).withAutoGap(2 * uicMargin);
 
-    vbol.add(titleLabelGaplessLayout(tsposeTitle));
-    vbol.add(jlo::Component(*tsposeButton).withHeight(uicLabelHeight));
+    auto topRow = jlo::HList().withHeight(topRowHeight).withAutoGap(2 * uicMargin);
 
-    lo.add(vbol);
+    auto col1 = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
+    col1.add(titleLabelGaplessLayout(voiceLimitL));
+    col1.add(jlo::Component(*voiceLimit).withHeight(uicLabelHeight));
+    col1.add(titleLabelGaplessLayout(uniTitle));
+    col1.add(jlo::Component(*uniCt).withHeight(uicLabelHeight));
+    col1.add(jlo::Component(*uniCtL).withHeight(uicLabelHeight));
+    col1.add(jlo::Component(*uniRPhase).withHeight(uicLabelHeight));
+    col1.add(sideLabelSlider(uniSpreadG, uniSpread));
+    col1.add(sideLabelSlider(uniPanG, uniPan));
+    topRow.add(col1);
 
-    // Play mode
-    auto pml = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
-    pml.add(titleLabelGaplessLayout(playTitle));
-    pml.add(jlo::Component(*playMode).withHeight(2 * uicLabelHeight + uicMargin));
-    pml.add(jlo::Component(*triggerButton).withHeight(uicLabelHeight));
-    pml.add(jlo::Component(*pianoModeButton).withHeight(uicLabelHeight));
-    pml.add(jlo::Component(*portaL).withHeight(uicLabelHeight));
-    pml.add(jlo::Component(*portaTime).withHeight(uicLabelHeight).insetBy(0, 2));
-    pml.add(jlo::Component(*portaContinuationButton).withHeight(uicLabelHeight));
-    lo.add(pml);
+    auto col2 = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
+    col2.add(titleLabelGaplessLayout(playTitle));
+    col2.add(jlo::Component(*playMode).withHeight(2 * uicLabelHeight + uicMargin));
+    col2.add(jlo::Component(*triggerButton).withHeight(uicLabelHeight));
+    col2.add(jlo::Component(*pianoModeButton).withHeight(uicLabelHeight));
+    col2.add(jlo::Component(*portaL).withHeight(uicLabelHeight));
+    col2.add(jlo::Component(*portaTime).withHeight(uicLabelHeight).insetBy(0, 2));
+    col2.add(jlo::Component(*portaContinuationButton).withHeight(uicLabelHeight));
+    topRow.add(col2);
 
-    // Unison Controls
-    auto uml = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
-    uml.add(titleLabelGaplessLayout(uniTitle));
-    uml.add(jlo::Component(*uniCt).withHeight(uicLabelHeight));
-    uml.add(jlo::Component(*uniCtL).withHeight(uicLabelHeight));
-    uml.add(jlo::Component(*uniRPhase).withHeight(uicLabelHeight));
-    uml.add(sideLabelSlider(uniSpreadG, uniSpread));
-    uml.add(sideLabelSlider(uniPanG, uniPan));
+    auto col3 = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
+    col3.add(titleLabelGaplessLayout(bendTitle));
+    col3.add(sideLabel(bUpL, bUp));
+    col3.add(sideLabel(bDnL, bDn));
+    col3.add(titleLabelGaplessLayout(tsposeTitle));
+    col3.add(jlo::Component(*tsposeButton).withHeight(uicLabelHeight));
+    topRow.add(col3);
 
-    lo.add(uml);
+    auto col4 = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
+    col4.add(titleLabelGaplessLayout(mtsTitle));
+    col4.add(jlo::Component(*mtsStatusLabel).withHeight(uicLabelHeight));
+    col4.add(titleLabelGaplessLayout(panicTitle));
+    col4.add(jlo::Component(*panicButton).withHeight(uicLabelHeight));
+    topRow.add(col4);
 
-    auto mpl = jlo::VList().withWidth(skinny).withAutoGap(uicMargin);
-    mpl.add(titleLabelGaplessLayout(mpeTitle));
-    mpl.add(jlo::Component(*mpeActiveButton).withHeight(uicLabelHeight));
-    mpl.add(jlo::Component(*mpeRange).withHeight(uicLabelHeight));
-    mpl.add(jlo::Component(*mpeRangeL).withHeight(uicLabelHeight));
+    outer.add(topRow);
 
-    mpl.add(titleLabelGaplessLayout(panicTitle));
-    mpl.add(jlo::Component(*panicButton).withHeight(uicLabelHeight));
-    lo.add(mpl);
+    auto fullWidth = getWidth() - 2 * uicMargin;
 
-    auto rsl = jlo::VList().withWidth(2 * skinny).withAutoGap(uicMargin);
-    rsl.add(titleLabelGaplessLayout(srStratLab));
-    rsl.add(jlo::Component(*srStrat).withHeight(uicLabelHeight));
-    rsl.add(jlo::Component(*rsEng).withHeight(uicLabelHeight));
-    lo.add(rsl);
+    // "MPE + Smoothing" section: full-width title with three rows underneath.
+    outer.add(titleLabelGaplessLayout(smoothingSectionTitle).withWidth(fullWidth));
 
-    lo.doLayout();
+    auto smoothingColHeight = 3 * uicLabelHeight + 2 * uicMargin;
+    auto smoothingCol =
+        jlo::VList().withWidth(fullWidth).withHeight(smoothingColHeight).withAutoGap(uicMargin);
+    int labelW = fullWidth / 3;
+
+    auto mpeRow = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+    mpeRow.add(jlo::Component(*mpeRowLabel).withWidth(labelW));
+    mpeRow.add(jlo::Component(*mpeActiveButtonD->widget).withWidth(uicSubPanelColumnWidth * 1.5));
+    mpeRow.add(jlo::Component(*mpeRangeL).withWidth(uicLabelHeight * 2));
+    mpeRow.add(jlo::Component(*mpeRangeEditor).expandToFill());
+    smoothingCol.add(mpeRow);
+
+    auto smRow = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+    smRow.add(jlo::Component(*smoothingRowLabel).withWidth(labelW));
+    smRow.add(jlo::Component(*midiSmoothingSliderD->widget).expandToFill().insetBy(0, 2));
+    smoothingCol.add(smRow);
+
+    auto psRow = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+    psRow.add(jlo::Component(*paramSmoothingRowLabel).withWidth(labelW));
+    psRow.add(jlo::Component(*paramSmoothingSliderD->widget).expandToFill().insetBy(0, 2));
+    smoothingCol.add(psRow);
+
+    outer.add(smoothingCol);
+
+    outer.add(titleLabelGaplessLayout(outputControlTitle).withWidth(fullWidth));
+
+    // Output signal path. Each row is "Label : [control(s)]". Saturation row also
+    // gets a drive HSlider following the type jog. Future revision will add
+    // arrow connectors between stages.
+    // Explicit height (9 rows) so the outer VList reserves space and the section below
+    // is placed beneath it rather than overlapping.
+    auto pathColHeight = 9 * uicLabelHeight + 8 * uicMargin;
+    auto pathCol =
+        jlo::VList().withWidth(fullWidth).withHeight(pathColHeight).withAutoGap(uicMargin);
+
+    auto stageRow = [&](auto &lbl, auto &c1, juce::Component *c2 = nullptr)
+    {
+        auto row = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+        row.add(jlo::Component(*lbl).withWidth(labelW));
+        if (c2)
+        {
+            // Split the right side: jog on the left (skinny), slider fills the rest
+            row.add(jlo::Component(*c1).withWidth(uicSubPanelColumnWidth * 1.5));
+            row.add(jlo::Component(*c2).expandToFill());
+        }
+        else
+        {
+            row.add(jlo::Component(*c1).expandToFill());
+        }
+        return row;
+    };
+
+    pathCol.add(stageRow(sampleRateLabel, srStrat));
+    pathCol.add(stageRow(ultrasonicLabel, ultrasonicFilter));
+    pathCol.add(stageRow(saturationLabel, satType, satDrive.get()));
+    {
+        // Sample Rate ZOH row: jog on the left, then a checkbox toggle + label.
+        auto row = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+        row.add(jlo::Component(*bitRateLabel).withWidth(labelW));
+        row.add(jlo::Component(*bitRate).withWidth(uicSubPanelColumnWidth * 1.5));
+        row.add(jlo::Component(*zohPreFilter).withWidth(uicLabelHeight));
+        row.add(jlo::Component(*zohPreFilterLabel).expandToFill());
+        pathCol.add(row);
+    }
+    pathCol.add(stageRow(bitDepthLabel, bitDepth));
+    pathCol.add(stageRow(lowpassLabel, lowpass));
+    pathCol.add(stageRow(highpassLabel, highpass));
+    {
+        // Output row: gain slider, then the legacy output toggle
+        auto row = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+        row.add(jlo::Component(*outGainLabel).withWidth(labelW));
+        row.add(jlo::Component(*outGain).expandToFill());
+        row.add(jlo::Component(*legacyOutputDsp).withWidth(uicSubPanelColumnWidth));
+        pathCol.add(row);
+    }
+    pathCol.add(stageRow(downsamplerLabel, rsEng));
+
+    outer.add(pathCol);
+
+    // "User Interface" section: zoom selector stacked above a theme selector + theme-editor button.
+    outer.add(titleLabelGaplessLayout(uiSectionTitle).withWidth(fullWidth));
+
+    auto uiCol = jlo::VList()
+                     .withWidth(fullWidth)
+                     .withHeight(2 * uicLabelHeight + uicMargin)
+                     .withAutoGap(uicMargin);
+
+    auto zoomRow = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+    zoomRow.add(jlo::Component(*zoomLabel).withWidth(labelW));
+    zoomRow.add(jlo::Component(*zoomButton).expandToFill());
+    uiCol.add(zoomRow);
+
+    auto themeRow = jlo::HList().withHeight(uicLabelHeight).withAutoGap(uicMargin);
+    themeRow.add(jlo::Component(*themeLabel).withWidth(labelW));
+    themeRow.add(jlo::Component(*themeButton).expandToFill());
+    themeRow.add(jlo::Component(*editThemeButton).withWidth(uicSubPanelColumnWidth));
+    uiCol.add(themeRow);
+
+    outer.add(uiCol);
+
+    outer.doLayout();
+}
+
+void PlayModeSubPanel::setUltrasonicLabel()
+{
+    auto nyq = editor.hostSR * 0.5f;
+    char txt[32];
+    if (nyq > 0)
+        snprintf(txt, sizeof(txt), "@ %g kHz", nyq / 1000.f);
+    else
+        snprintf(txt, sizeof(txt), "On");
+    ultrasonicFilter->setLabel(txt);
+    ultrasonicFilter->repaint();
 }
 
 void PlayModeSubPanel::setTriggerButtonLabel()
 {
-    auto v = (int)std::round(editor.patchCopy.output.defaultTrigger.value);
+    auto v = (int)std::round(editor.patchMainRef.output.defaultTrigger.value);
     switch (v)
     {
     case KEY_PRESS:
@@ -274,14 +701,14 @@ void PlayModeSubPanel::setTriggerButtonLabel()
 
 void PlayModeSubPanel::showTriggerButtonMenu()
 {
-    auto tmv = (int)std::round(editor.patchCopy.output.defaultTrigger.value);
+    auto tmv = (int)std::round(editor.patchMainRef.output.defaultTrigger.value);
 
     auto genSet = [w = juce::Component::SafePointer(this)](int nv)
     {
         auto that = w;
         return [nv, that]()
         {
-            auto &p = that->editor.patchCopy.output.defaultTrigger;
+            auto &p = that->editor.patchMainRef.output.defaultTrigger;
             that->editor.setAndSendParamValue(p, nv);
             that->setTriggerButtonLabel();
         };
@@ -294,26 +721,26 @@ void PlayModeSubPanel::showTriggerButtonMenu()
         p.addItem(TriggerModeName[g], true, tmv == g, genSet(g));
     }
     p.addSeparator();
-    auto rpo = editor.patchCopy.output.rephaseOnRetrigger;
-    auto rnp = editor.patchCopy.output.uniPhaseRand;
-    auto uc = (int)editor.patchCopy.output.unisonCount.value;
+    auto rpo = editor.patchMainRef.output.rephaseOnRetrigger;
+    auto rnp = editor.patchMainRef.output.uniPhaseRand;
+    auto uc = (int)editor.patchMainRef.output.unisonCount.value;
     p.addItem("Reset Phase on Retrigger", !rnp || (uc == 1), rpo,
               [rpo, w = juce::Component::SafePointer(this)]()
               {
                   if (!w)
                       return;
-                  w->editor.setAndSendParamValue(w->editor.patchCopy.output.rephaseOnRetrigger,
+                  w->editor.setAndSendParamValue(w->editor.patchMainRef.output.rephaseOnRetrigger,
                                                  !rpo);
               });
 
     p.addSeparator();
-    auto atfl = editor.patchCopy.output.attackFloorOnRetrig;
+    auto atfl = editor.patchMainRef.output.attackFloorOnRetrig;
     p.addItem("Attack Floored on Retrigger", true, atfl,
               [atfl, w = juce::Component::SafePointer(this)]()
               {
                   if (!w)
                       return;
-                  w->editor.setAndSendParamValue(w->editor.patchCopy.output.attackFloorOnRetrig,
+                  w->editor.setAndSendParamValue(w->editor.patchMainRef.output.attackFloorOnRetrig,
                                                  !atfl);
               });
 
@@ -323,7 +750,7 @@ void PlayModeSubPanel::showTriggerButtonMenu()
 
 void PlayModeSubPanel::setPortaContinuationLabel()
 {
-    auto v = (int)std::round(editor.patchCopy.output.portaContMode.value);
+    auto v = (int)std::round(editor.patchMainRef.output.portaContMode.value);
     switch (v)
     {
     case 0:
@@ -340,14 +767,14 @@ void PlayModeSubPanel::setPortaContinuationLabel()
 
 void PlayModeSubPanel::showPortaContinuationMenu()
 {
-    auto tmv = (int)std::round(editor.patchCopy.output.portaContMode.value);
+    auto tmv = (int)std::round(editor.patchMainRef.output.portaContMode.value);
 
     auto genSet = [w = juce::Component::SafePointer(this)](int nv)
     {
         auto that = w;
         return [nv, that]()
         {
-            auto &p = that->editor.patchCopy.output.portaContMode;
+            auto &p = that->editor.patchMainRef.output.portaContMode;
             that->editor.setAndSendParamValue(p, nv);
             that->setPortaContinuationLabel();
         };
@@ -363,16 +790,131 @@ void PlayModeSubPanel::showPortaContinuationMenu()
                     makeMenuAccessibleButtonCB(portaContinuationButton.get()));
 }
 
+void PlayModeSubPanel::showSmoothingDefaultsMenu()
+{
+    auto p = juce::PopupMenu();
+    p.addSectionHeader("MPE + Smoothing");
+    p.addSeparator();
+    p.addItem("Save as MPE/Smoothing Defaults",
+              [w = juce::Component::SafePointer(this)]()
+              {
+                  if (!w || !w->editor.defaultsProvider)
+                      return;
+                  auto &des = w->editor.dawStateMainRef.audio;
+                  auto *dp = w->editor.defaultsProvider;
+                  dp->updateUserDefaultValue(Defaults::defaultMPEBend, des.mpeBendRange);
+                  dp->updateUserDefaultValue(Defaults::defaultMIDISmoothing,
+                                             std::to_string(des.midiCCSmoothingTimeMs));
+                  dp->updateUserDefaultValue(Defaults::defaultParamSmoothing,
+                                             std::to_string(des.paramAutomationSmoothingTimeMs));
+              });
+    p.showMenuAsync(juce::PopupMenu::Options().withParentComponent(&this->editor));
+}
+
+void PlayModeSubPanel::setZoomButtonLabel()
+{
+    auto pct = (int)std::round(editor.zoomFactor * 100);
+    zoomButton->setLabel(std::to_string(pct) + "%");
+}
+
+void PlayModeSubPanel::showZoomMenu()
+{
+    auto p = juce::PopupMenu();
+    p.addSectionHeader("Zoom Level");
+    p.addSeparator();
+    for (auto scale : {75, 90, 100, 110, 125, 150, 175, 200})
+    {
+        auto isCur = std::fabs(editor.zoomFactor * 100 - scale) < 2;
+        p.addItem("Zoom " + std::to_string(scale) + "%", true, isCur,
+                  [s = scale, w = juce::Component::SafePointer(this)]()
+                  {
+                      if (!w)
+                          return;
+                      w->editor.setZoomFactor(s * 0.01);
+                      w->setZoomButtonLabel();
+                  });
+    }
+    p.showMenuAsync(juce::PopupMenu::Options().withParentComponent(&this->editor),
+                    makeMenuAccessibleButtonCB(zoomButton.get()));
+}
+
+void PlayModeSubPanel::setThemeButtonLabel()
+{
+    std::string disp{"Dark"};
+    if (editor.defaultsProvider)
+    {
+        auto stored = editor.defaultsProvider->getUserDefaultValue(Defaults::themePath,
+                                                                   std::string("factory:Dark"));
+        auto sentinel = std::string(SixSinesEditor::factoryThemeSentinel);
+        if (stored.rfind(sentinel, 0) == 0)
+            disp = stored.substr(sentinel.size());
+        else
+            disp = fs::path(stored).stem().u8string();
+    }
+    themeButton->setLabel(disp);
+}
+
+void PlayModeSubPanel::showThemeMenu()
+{
+    auto p = juce::PopupMenu();
+    p.addSectionHeader("Theme");
+    p.addSeparator();
+    if (editor.uiThemeManager && editor.defaultsProvider)
+    {
+        auto stored = editor.defaultsProvider->getUserDefaultValue(Defaults::themePath,
+                                                                   std::string("factory:Dark"));
+        auto sentinel = std::string(SixSinesEditor::factoryThemeSentinel);
+        for (auto &ft : editor.uiThemeManager->factoryThemes)
+        {
+            auto isCur = (stored == sentinel + ft.name);
+            p.addItem(ft.name, true, isCur,
+                      [w = juce::Component::SafePointer(this), skin = ft.skin, name = ft.name]()
+                      {
+                          if (!w)
+                              return;
+                          w->editor.applyTheme(
+                              skin, std::string(SixSinesEditor::factoryThemeSentinel) + name);
+                          w->setThemeButtonLabel();
+                      });
+            if (ft.name == "Light")
+                p.addSeparator();
+        }
+
+        editor.uiThemeManager->rescanUserThemes();
+        if (!editor.uiThemeManager->userThemes.empty())
+        {
+            p.addSeparator();
+            for (auto &path : editor.uiThemeManager->userThemes)
+            {
+                auto name = path.stem().u8string();
+                auto isCur = (stored == path.u8string());
+                p.addItem(name, true, isCur,
+                          [w = juce::Component::SafePointer(this), path]()
+                          {
+                              if (!w || !w->editor.uiThemeManager)
+                                  return;
+                              w->editor.applyTheme(
+                                  w->editor.uiThemeManager->loadThemeFromPath(path),
+                                  path.u8string());
+                              w->setThemeButtonLabel();
+                          });
+            }
+        }
+    }
+    p.showMenuAsync(juce::PopupMenu::Options().withParentComponent(&this->editor),
+                    makeMenuAccessibleButtonCB(themeButton.get()));
+}
+
 void PlayModeSubPanel::setEnabledState()
 {
-    auto vm = editor.patchCopy.output.playMode.value;
+    auto vm = editor.patchMainRef.output.playMode.value;
     auto en = vm > 0.5;
     portaL->setEnabled(en);
     portaTime->setEnabled(en);
     portaContinuationButton->setEnabled(en);
     pianoModeButton->setEnabled(!en);
 
-    auto uc = editor.patchCopy.output.unisonCount.value;
+    auto uc = editor.patchMainRef.output.unisonCount.value;
     uniSpread->setEnabled(uc > 1.5);
     uniSpreadG->setEnabled(uc > 1.5);
     uniPan->setEnabled(uc > 1.5);
@@ -383,8 +925,12 @@ void PlayModeSubPanel::setEnabledState()
     else
         uniCtL->setText("Voices");
 
-    auto me = editor.patchCopy.output.mpeActive.value > 0.5;
-    mpeRange->setEnabled(me);
+    auto brOn = editor.patchMainRef.output.bitRateAdjust.value > 0.5;
+    zohPreFilter->setEnabled(brOn);
+    zohPreFilterLabel->setEnabled(brOn);
+
+    auto me = editor.dawStateMainRef.audio.mpeActive;
+    mpeRangeEditor->setEnabled(me);
     mpeRangeL->setEnabled(me);
 
     repaint();
@@ -395,33 +941,62 @@ void PlayModeSubPanel::showPolyLimitMenu()
     auto p = juce::PopupMenu();
     p.addSectionHeader("Voice Limit");
     p.addSeparator();
-    auto currentLimit = getPolyLimit();
-    for (auto lim : {4, 6, 8, 12, 16, 24, 32, 48, 64})
+    auto currentLimit = (int)std::round(editor.patchMainRef.output.polyLimit.value);
+    for (auto lim : voiceLimit->steps)
     {
         p.addItem(std::to_string(lim), true, lim == currentLimit,
                   [w = juce::Component::SafePointer(this), lim]()
                   {
                       if (!w)
                           return;
-                      w->setPolyLimit(lim);
+                      w->editor.setAndSendParamValue(w->editor.patchMainRef.output.polyLimit, lim,
+                                                     true, true);
                   });
     }
     p.showMenuAsync(juce::PopupMenu::Options().withParentComponent(&editor));
 }
 
-int PlayModeSubPanel::getPolyLimit()
+void PlayModeSubPanel::updateMTSStatus()
 {
-    return (int)std::round(editor.patchCopy.output.polyLimit.value);
-}
-void PlayModeSubPanel::setPolyLimit(int plVal)
-{
-    SXSNLOG("Setting val to " << plVal);
-    auto &pl = editor.patchCopy.output.polyLimit;
-    editor.setAndSendParamValue(pl, plVal);
+    if (++mtsIdleCount < 50)
+        return;
+    mtsIdleCount = 0;
 
-    voiceLimit->setLabelAndTitle(std::to_string(getPolyLimit()),
-                                 "Voice Limit " + std::to_string(getPolyLimit()));
-    voiceLimit->repaint();
+    auto *cli = editor.mtsClient;
+    bool connected = cli && MTS_HasMaster(cli);
+    std::string text;
+    if (connected)
+    {
+        const char *name = MTS_GetScaleName(cli);
+        text = (name && *name) ? std::string(name) : std::string("Connected");
+    }
+    else
+    {
+        text = "No MTS";
+    }
+
+    if (connected != mtsConnected || text != mtsStatusLabel->getText())
+    {
+        mtsConnected = connected;
+        mtsStatusLabel->setEnabled(connected);
+        mtsStatusLabel->setText(text);
+    }
+}
+
+void PlayModeSubPanel::refreshMpeRangeEditor()
+{
+    auto v = editor.dawStateMainRef.audio.mpeBendRange;
+    mpeRangeEditor->setAllText(std::to_string(v));
+}
+
+void PlayModeSubPanel::commitMpeRangeEditor()
+{
+    auto txt = mpeRangeEditor->getText().trim();
+    int v = txt.isEmpty() ? editor.dawStateMainRef.audio.mpeBendRange : txt.getIntValue();
+    v = std::clamp(v, 1, 96);
+    editor.dawStateMainRef.audio.mpeBendRange = v;
+    editor.pushAudioDawState();
+    refreshMpeRangeEditor();
 }
 
 } // namespace baconpaul::six_sines::ui

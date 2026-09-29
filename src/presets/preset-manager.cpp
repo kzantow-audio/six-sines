@@ -14,9 +14,10 @@
  */
 
 #include "preset-manager.h"
+#include "synth/synth.h"
 #include <sstream>
 #include <fstream>
-#include "sst/plugininfra/paths.h"
+#include <cstring>
 
 #include "sst/plugininfra/strnatcmp.h"
 
@@ -27,16 +28,109 @@ CMRC_DECLARE(sixsines_patches);
 namespace baconpaul::six_sines::presets
 {
 
+namespace
+{
+// Name + dirty are main-thread-only patch state: the audio patch never reads them, and the editor
+// reads them straight off patchMain. Set them on the patch (== patchMain) here rather than
+// round-tripping through the queues. Author + macro names were already written by fromState /
+// resetToInit; the funnel moves only param values into the audio patch.
+void nameAndMarkClean(Patch &patch, const std::string &name)
+{
+    memset(patch.name, 0, sizeof(patch.name));
+    strncpy(patch.name, name.c_str(), sizeof(patch.name) - 1);
+    patch.dirty = false;
+}
+} // namespace
+
+std::string PresetManager::stripPresetExtension(const std::string &fileName)
+{
+    std::string ext{presetExtension};
+    if (fileName.size() >= ext.size() &&
+        fileName.compare(fileName.size() - ext.size(), ext.size(), ext) == 0)
+        return fileName.substr(0, fileName.size() - ext.size());
+    return fileName;
+}
+
+PresetManager::LoadedPreset PresetManager::LoadedPreset::init()
+{
+    return {Kind::Init, {}, {}, "Init"};
+}
+
+PresetManager::LoadedPreset PresetManager::LoadedPreset::factory(const std::string &cat,
+                                                                 const std::string &file)
+{
+    return {Kind::Factory, cat, fs::path{file}, stripPresetExtension(file)};
+}
+
+PresetManager::LoadedPreset PresetManager::LoadedPreset::user(const fs::path &relative)
+{
+    auto dn = relative.filename();
+    return {Kind::User, {}, relative, dn.replace_extension("").u8string()};
+}
+
+PresetManager::LoadedPreset PresetManager::LoadedPreset::unknown(const std::string &name)
+{
+    return {Kind::Unknown, {}, {}, name};
+}
+
+std::string PresetManager::LoadedPreset::sessionKind() const
+{
+    switch (kind)
+    {
+    case Kind::Init:
+        return "init";
+    case Kind::Factory:
+        return "factory";
+    case Kind::User:
+        return "user";
+    case Kind::Unknown:
+        break;
+    }
+    return "";
+}
+
+PresetManager::LoadedPreset PresetManager::LoadedPreset::fromSession(const std::string &kind,
+                                                                     const std::string &cat,
+                                                                     const std::string &path)
+{
+    if (kind == "init")
+        return init();
+    if (kind == "factory")
+        return factory(cat, path);
+    if (kind == "user")
+        return user(fs::u8path(path));
+    return unknown("");
+}
+
+PresetManager::LoadedPreset PresetManager::identifyUserPath(const fs::path &absolute) const
+{
+    auto dn = absolute.filename();
+    dn = dn.replace_extension("");
+
+    if (userPatchesPath.empty())
+        return LoadedPreset::unknown(dn.u8string());
+
+    // purely lexical, to match how rescanUserPresets stores the entries
+    auto rel = absolute.lexically_relative(userPatchesPath);
+    if (rel.empty() || *rel.begin() == "..")
+        return LoadedPreset::unknown(dn.u8string());
+
+    return LoadedPreset::user(rel);
+}
+
 PresetManager::PresetManager(const clap_host_t *ch) : clapHost(ch)
 {
     try
     {
-        userPath = sst::plugininfra::paths::bestDocumentsFolderPathFor("SixSines");
+        userPath = Synth::userDocumentsPath();
         if (clapHost)
             fs::create_directories(userPath);
         userPatchesPath = userPath / "Patches";
         if (clapHost)
             fs::create_directories(userPatchesPath);
+        userWavetablesPath = userPath / "Wavetables";
+        if (clapHost)
+            fs::create_directories(userWavetablesPath);
     }
     catch (fs::filesystem_error &e)
     {
@@ -57,8 +151,7 @@ PresetManager::PresetManager(const clap_host_t *ch) : clapHost(ch)
                     ents.push_back(p.filename());
                 }
 
-                std::sort(ents.begin(), ents.end(),
-                          [](const auto &a, const auto &b)
+                std::sort(ents.begin(), ents.end(), [](const auto &a, const auto &b)
                           { return strnatcasecmp(a.c_str(), b.c_str()) < 0; });
                 factoryPatchNames[d.filename()] = ents;
             }
@@ -141,6 +234,8 @@ void PresetManager::rescanUserPresets()
     catch (fs::filesystem_error &)
     {
     }
+
+    userPatchesEpoch++;
 }
 
 #if USE_WCHAR_PRESET
@@ -180,10 +275,11 @@ void PresetManager::loadUserPresetDirect(Patch &patch, Synth::mainToAudioQueue_T
 
     patch.fromState(buffer.str());
 
-    auto dn = p.filename().replace_extension("").u8string();
-    sendEntirePatchToAudio(patch, mainToAudio, dn);
+    auto loaded = identifyUserPath(p);
+    nameAndMarkClean(patch, loaded.displayName);
+    Synth::sendEntirePatchToAudio(patch, mainToAudio, clapHost);
     if (onPresetLoaded)
-        onPresetLoaded(dn);
+        onPresetLoaded(loaded);
 }
 
 void PresetManager::loadFactoryPreset(Patch &patch, Synth::mainToAudioQueue_T &mainToAudio,
@@ -209,17 +305,13 @@ void PresetManager::loadFactoryPreset(Patch &patch, Synth::mainToAudioQueue_T &m
             return;
         }
 
-        auto noExt = pat;
-        auto ps = noExt.find(".sxsnp");
-        if (ps != std::string::npos)
-        {
-            noExt = noExt.substr(0, ps);
-        }
-        sendEntirePatchToAudio(patch, mainToAudio, noExt);
+        auto loaded = LoadedPreset::factory(cat, pat);
+        nameAndMarkClean(patch, loaded.displayName);
+        Synth::sendEntirePatchToAudio(patch, mainToAudio, clapHost);
 
         if (onPresetLoaded)
         {
-            onPresetLoaded(noExt);
+            onPresetLoaded(loaded);
         }
     }
     catch (const std::exception &e)
@@ -231,57 +323,11 @@ void PresetManager::loadFactoryPreset(Patch &patch, Synth::mainToAudioQueue_T &m
 void PresetManager::loadInit(Patch &patch, Synth::mainToAudioQueue_T &mainToAudio)
 {
     patch.resetToInit();
-    sendEntirePatchToAudio(patch, mainToAudio, "Init");
+    auto loaded = LoadedPreset::init();
+    nameAndMarkClean(patch, loaded.displayName);
+    Synth::sendEntirePatchToAudio(patch, mainToAudio, clapHost);
     if (onPresetLoaded)
-        onPresetLoaded("Init");
-}
-
-void PresetManager::sendEntirePatchToAudio(Patch &patch, Synth::mainToAudioQueue_T &mainToAudio,
-                                           const std::string &s)
-{
-    if (!clapHostParams)
-    {
-        clapHostParams = static_cast<const clap_host_params_t *>(
-            clapHost->get_extension(clapHost, CLAP_EXT_PARAMS));
-    }
-    sendEntirePatchToAudio(patch, mainToAudio, s, clapHost, clapHostParams);
-}
-
-void PresetManager::sendEntirePatchToAudio(Patch &patch, Synth::mainToAudioQueue_T &mainToAudio,
-                                           const std::string &name, const clap_host_t *h,
-                                           const clap_host_params_t *hostPar)
-{
-    if (!h)
-        return;
-
-    if (hostPar == nullptr)
-    {
-        hostPar = static_cast<const clap_host_params_t *>(h->get_extension(h, CLAP_EXT_PARAMS));
-    }
-    static char stringBuffer[128][256];
-    static int currentString{0};
-
-    char *tmpDat = stringBuffer[currentString];
-    currentString = (currentString + 1) % 128;
-
-    memset(tmpDat, 0, 128 * sizeof(char));
-    strncpy(tmpDat, name.c_str(), 255);
-    mainToAudio.push({Synth::MainToAudioMsg::SEND_PATCH_NAME, 0, 0.f, tmpDat});
-    mainToAudio.push({Synth::MainToAudioMsg::STOP_AUDIO});
-    for (const auto &p : patch.params)
-    {
-        mainToAudio.push(
-            {Synth::MainToAudioMsg::SET_PARAM_WITHOUT_NOTIFYING, p->meta.id, p->value});
-    }
-    mainToAudio.push({Synth::MainToAudioMsg::START_AUDIO});
-    mainToAudio.push({Synth::MainToAudioMsg::SEND_PATCH_IS_CLEAN, true});
-    mainToAudio.push({Synth::MainToAudioMsg::SEND_POST_LOAD, true});
-    mainToAudio.push({Synth::MainToAudioMsg::SEND_REQUEST_RESCAN, true});
-
-    if (hostPar)
-    {
-        hostPar->request_flush(h);
-    }
+        onPresetLoaded(loaded);
 }
 
 } // namespace baconpaul::six_sines::presets

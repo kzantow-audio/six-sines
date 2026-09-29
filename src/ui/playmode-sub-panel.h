@@ -17,6 +17,11 @@
 #define BACONPAUL_SIX_SINES_UI_PLAYMODE_SUB_PANEL_H
 
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <sst/jucegui/component-adapters/DiscreteToReference.h>
+#include <sst/jucegui/component-adapters/ContinuousToReference.h>
+#include <sst/jucegui/components/TextEditor.h>
+#include <sst/jucegui/components/JogUpDownButton.h>
+#include <sst/jucegui/components/HSliderFilled.h>
 #include "six-sines-editor.h"
 #include "dahdsr-components.h"
 #include "lfo-components.h"
@@ -24,10 +29,17 @@
 
 namespace baconpaul::six_sines::ui
 {
+// A JogUpDownButton whose arrows / wheel / menu step through a fixed set of values (the
+// voice-limit choices) rather than every integer in the range. Defined in the .cpp.
+struct SteppedJogButton;
+
+// As with the base JogUpDownButton, the value is shown in the label so a tooltip is redundant.
+template <> constexpr bool suppressTooltipByWidget<SteppedJogButton>() { return true; }
+
 struct PlayModeSubPanel : juce::Component, HasEditor
 {
     PlayModeSubPanel(SixSinesEditor &e);
-    ~PlayModeSubPanel() = default;
+    ~PlayModeSubPanel();
 
     void resized() override;
 
@@ -37,7 +49,11 @@ struct PlayModeSubPanel : juce::Component, HasEditor
     std::unique_ptr<jcmp::MultiSwitch> playMode;
     std::unique_ptr<PatchDiscrete> playModeD;
 
-    std::unique_ptr<jcmp::RuledLabel> bendTitle, uniTitle, mpeTitle, tsposeTitle, panicTitle;
+    std::unique_ptr<jcmp::RuledLabel> bendTitle, uniTitle, tsposeTitle, panicTitle, mtsTitle;
+    std::unique_ptr<jcmp::Label> mtsStatusLabel;
+    int mtsIdleCount{0};
+    bool mtsConnected{false};
+    void updateMTSStatus();
 
     std::unique_ptr<jcmp::Label> bUpL, bDnL;
     std::unique_ptr<PatchContinuous> bUpD, bDnD;
@@ -67,33 +83,84 @@ struct PlayModeSubPanel : juce::Component, HasEditor
     std::unique_ptr<PatchDiscrete> uniRPhaseDD;
 
     std::unique_ptr<jcmp::HSliderFilled> uniSpread, uniPan;
-    std::unique_ptr<PatchContinuous> uniSpreadD, uniPanD;
+    std::unique_ptr<PatchContinuous::cubic_t> uniSpreadD;
+    std::unique_ptr<PatchContinuous> uniPanD;
     std::unique_ptr<jcmp::GlyphPainter> uniSpreadG, uniPanG;
 
-    std::unique_ptr<jcmp::ToggleButton> mpeActiveButton;
-    std::unique_ptr<PatchDiscrete> mpeActiveButtonD;
+    // MPE controls bind to engine-instance state (Synth::DawStateMain::audio, shared by reference),
+    // not to patch params. DiscreteToValueReference owns the widget pointer; the JogUpDown
+    // variant is subclassed in the .cpp to set its 1..96 range.
+    std::unique_ptr<
+        sst::jucegui::component_adapters::DiscreteToValueReference<jcmp::ToggleButton, bool>>
+        mpeActiveButtonD;
 
-    std::unique_ptr<jcmp::JogUpDownButton> mpeRange;
-    std::unique_ptr<PatchDiscrete> mpeRangeD;
+    std::unique_ptr<jcmp::TextEditor> mpeRangeEditor;
     std::unique_ptr<jcmp::Label> mpeRangeL;
+    void refreshMpeRangeEditor();
+    void commitMpeRangeEditor();
+
+    // "MPE + Smoothing" settings section below the top row.
+    std::unique_ptr<jcmp::RuledLabel> smoothingSectionTitle;
+    std::unique_ptr<jcmp::Label> mpeRowLabel, smoothingRowLabel, paramSmoothingRowLabel;
+    // ContinuousToValueReference owns the HSliderFilled (access via ->widget) and binds it to
+    // the ms smoothing floats in dawStateMainRef.audio, which are not patch params.
+    std::unique_ptr<
+        sst::jucegui::component_adapters::ContinuousToValueReference<jcmp::HSliderFilled>>
+        midiSmoothingSliderD, paramSmoothingSliderD;
+    // Section hamburger: persist the current MPE bend range + smoothing times as user defaults.
+    void showSmoothingDefaultsMenu();
 
     std::unique_ptr<jcmp::JogUpDownButton> tsposeButton;
     std::unique_ptr<PatchDiscrete> tsposeButtonD;
 
-    std::unique_ptr<jcmp::MenuButton> voiceLimit;
+    std::unique_ptr<SteppedJogButton> voiceLimit;
+    std::unique_ptr<PatchDiscrete> voiceLimitD;
     std::unique_ptr<jcmp::RuledLabel> voiceLimitL;
 
     std::unique_ptr<jcmp::TextPushButton> panicButton;
 
-    std::unique_ptr<jcmp::RuledLabel> srStratLab;
+    std::unique_ptr<jcmp::RuledLabel> outputControlTitle;
+
     std::unique_ptr<jcmp::JogUpDownButton> srStrat;
     std::unique_ptr<PatchDiscrete> srStratD;
     std::unique_ptr<jcmp::JogUpDownButton> rsEng;
     std::unique_ptr<PatchDiscrete> rsEngD;
 
+    std::unique_ptr<jcmp::JogUpDownButton> satType, lowpass, bitRate, bitDepth, highpass;
+    std::unique_ptr<PatchDiscrete> satTypeD, lowpassD, bitRateD, bitDepthD, highpassD;
+
+    std::unique_ptr<jcmp::HSliderFilled> satDrive;
+    std::unique_ptr<PatchContinuous> satDriveD;
+
+    std::unique_ptr<jcmp::ToggleButton> zohPreFilter;
+    std::unique_ptr<PatchDiscrete> zohPreFilterD;
+    std::unique_ptr<jcmp::Label> zohPreFilterLabel;
+
+    std::unique_ptr<jcmp::ToggleButton> ultrasonicFilter;
+    std::unique_ptr<PatchDiscrete> ultrasonicFilterD;
+    void setUltrasonicLabel();
+
+    std::unique_ptr<jcmp::ToggleButton> legacyOutputDsp;
+    std::unique_ptr<PatchDiscrete> legacyOutputDspD;
+
+    std::unique_ptr<jcmp::HSliderFilled> outGain;
+    std::unique_ptr<PatchContinuous> outGainD;
+    std::unique_ptr<jcmp::Label> outGainLabel;
+
+    std::unique_ptr<jcmp::Label> sampleRateLabel, downsamplerLabel;
+    std::unique_ptr<jcmp::Label> saturationLabel, lowpassLabel, bitRateLabel, bitDepthLabel,
+        highpassLabel, ultrasonicLabel;
+
+    // "User Interface" section: zoom + theme selectors, plus a button to open the theme editor.
+    std::unique_ptr<jcmp::RuledLabel> uiSectionTitle;
+    std::unique_ptr<jcmp::Label> zoomLabel, themeLabel;
+    std::unique_ptr<jcmp::TextPushButton> zoomButton, themeButton, editThemeButton;
+    void setZoomButtonLabel();
+    void showZoomMenu();
+    void setThemeButtonLabel();
+    void showThemeMenu();
+
     void showPolyLimitMenu();
-    int getPolyLimit();
-    void setPolyLimit(int pl);
 };
 } // namespace baconpaul::six_sines::ui
 #endif // MIXER_SUB_PANE_H

@@ -40,10 +40,14 @@ Voice::Voice(const Patch &p, MonoValues &mv)
           {
               return MatrixNodeFrom(p.matrixNodes[i], this->targetAtMatrix(i),
                                     this->sourceAtMatrix(i), mv, voiceValues);
-          }))
+          })),
+      macroNode(scpu::make_array_lambda<MacroVoiceNode, numMacros>(
+          [&p, this, &mv](auto i) { return MacroVoiceNode(p.macroNodes[i], mv, voiceValues); }))
 {
     std::fill(isKeytrack.begin(), isKeytrack.end(), true);
     std::fill(cmRatio.begin(), cmRatio.end(), 1.f);
+    for (int i = 0; i < numOps; ++i)
+        src[i].opIndex = i;
 }
 
 void Voice::attack()
@@ -51,6 +55,28 @@ void Voice::attack()
     voiceValues.velocityLag.snapTo(voiceValues.velocity);
     voiceValues.velocityLag.setRateInMilliseconds(10, monoValues.sr.sampleRate, 1.0 / blockSize);
 
+    // MPE / note-expression lags: configure rate here but defer the snap to the
+    // first renderBlock — voicemanager dispatches the initial MPE setters AFTER
+    // attack() but before the first audio block, so snapping here would capture
+    // stale values and audibly chirp into the real ones.
+    // Engine-wide smoothing time, in milliseconds, shared with the MIDI CC lag.
+    const float mpeLagMs = monoValues.midiCCSmoothingTimeMs;
+    voiceValues.mpeBendInSemisLag.setRateInMilliseconds(mpeLagMs, monoValues.sr.sampleRate,
+                                                        1.0 / blockSize);
+    voiceValues.mpeTimbreLag.setRateInMilliseconds(mpeLagMs, monoValues.sr.sampleRate,
+                                                   1.0 / blockSize);
+    voiceValues.mpeTimbreBipolarLag.setRateInMilliseconds(mpeLagMs, monoValues.sr.sampleRate,
+                                                          1.0 / blockSize);
+    voiceValues.mpePressureLag.setRateInMilliseconds(mpeLagMs, monoValues.sr.sampleRate,
+                                                     1.0 / blockSize);
+    voiceValues.noteExpressionTuningInSemisLag.setRateInMilliseconds(
+        mpeLagMs, monoValues.sr.sampleRate, 1.0 / blockSize);
+    voiceValues.noteExpressionPanBipolarLag.setRateInMilliseconds(
+        mpeLagMs, monoValues.sr.sampleRate, 1.0 / blockSize);
+    voiceValues.firstBlockAfterAttack = true;
+
+    for (auto &n : macroNode)
+        n.attack();
     out.attack();
     for (auto &n : mixerNode)
         n.attack();
@@ -61,20 +87,85 @@ void Voice::attack()
     for (auto &n : matrixNode)
         n.attack();
 
+    // power buttons latch at attack, so who reads each op is fixed for the note
+    for (int i = numOps - 1; i >= 0; --i)
+    {
+        bool used = mixerNode[i].active;
+        for (int j = i + 1; j < (int)numOps && !used; ++j)
+            used = matrixNode[MatrixIndex::positionForSourceTarget(i, j)].active &&
+                   src[j].active && src[j].outputUsedCachedAtAttack;
+        src[i].outputUsedCachedAtAttack = used;
+    }
+
     voiceValues.setGated(true);
 }
 
 void Voice::renderBlock()
 {
-    float retuneKey = voiceValues.key;
-    if (monoValues.mtsClient && MTS_HasMaster(monoValues.mtsClient))
+    // Advance MPE / note-expression lags before any pitch math or per-node mod
+    // matrix evaluation. On the first block after attack, snap (voicemanager
+    // has already pushed initial setter values into voiceValues at this point);
+    // afterwards smooth.
+    auto stepLag = [g = voiceValues.firstBlockAfterAttack](auto &lag, float target)
     {
-        retuneKey +=
-            MTS_RetuningInSemitones(monoValues.mtsClient, voiceValues.key, voiceValues.channel);
+        if (g)
+            lag.snapTo(target);
+        else
+        {
+            lag.setTarget(target);
+            lag.process();
+        }
+    };
+    stepLag(voiceValues.mpeBendInSemisLag, voiceValues.mpeBendInSemis);
+    stepLag(voiceValues.mpeTimbreLag, voiceValues.mpeTimbre);
+    stepLag(voiceValues.mpeTimbreBipolarLag, voiceValues.mpeTimbreBipolar);
+    stepLag(voiceValues.mpePressureLag, voiceValues.mpePressure);
+    stepLag(voiceValues.noteExpressionTuningInSemisLag, voiceValues.noteExpressionTuningInSemis);
+    stepLag(voiceValues.noteExpressionPanBipolarLag, voiceValues.noteExpressionPanBipolar);
+
+    // Refresh unison-derived per-voice scalars from the (smoothed) mono hoists so
+    // unisonSpread / unisonPan track host automation and UI knob moves mid-note.
+    if (voiceValues.uniCount > 1)
+    {
+        const float prod = monoValues.unisonSpreadFactorMinus1 * voiceValues.uniPMScale;
+        voiceValues.uniRatioMul =
+            (voiceValues.uniPMScale >= 0.f) ? (1.f + prod) : (1.f / (1.f - prod));
+        voiceValues.uniPanShift =
+            std::clamp(monoValues.unisonPanScalar * voiceValues.uniPMScale, -1.f, 1.f);
+    }
+
+    float retuneKey = voiceValues.key;
+    if (monoValues.mtsHasMaster)
+    {
+        if (monoValues.mpeActive)
+        {
+            // Interpolate the MTS retuning across the two semitones the
+            // bent key straddles, so MPE bend tracks the local scale slope.
+            const float bend = voiceValues.mpeBendInSemisLag.v;
+            float floatKey = (float)voiceValues.key + bend;
+            int iFloatKey = (int)std::floor(floatKey);
+            int loKey = std::clamp(iFloatKey, 0, 126);
+            int hiKey = loKey + 1;
+            float frac = std::clamp(floatKey - (float)loKey, 0.f, 1.f);
+            float loRetune =
+                MTS_RetuningInSemitones(monoValues.mtsClient, loKey, voiceValues.channel);
+            float hiRetune =
+                MTS_RetuningInSemitones(monoValues.mtsClient, hiKey, voiceValues.channel);
+            retuneKey += bend + (1.f - frac) * loRetune + frac * hiRetune;
+        }
+        else
+        {
+            retuneKey +=
+                MTS_RetuningInSemitones(monoValues.mtsClient, voiceValues.key, voiceValues.channel);
+        }
+    }
+    else
+    {
+        retuneKey += voiceValues.mpeBendInSemisLag.v;
     }
     retuneKey += ((monoValues.pitchBend >= 0) ? out.bendUp : out.bendDown) * monoValues.pitchBend;
-    retuneKey += voiceValues.portaDiff * voiceValues.portaSign + voiceValues.mpeBendInSemis +
-                 voiceValues.noteExpressionTuningInSemis;
+    retuneKey += voiceValues.portaDiff * voiceValues.portaSign;
+    retuneKey += voiceValues.noteExpressionTuningInSemisLag.v;
     retuneKey += out.fineTune * 0.01 + out.ftModNode.coarseTune + out.ftModNode.level * 2 +
                  out.ftModNode.coarseLevel;
 
@@ -97,9 +188,30 @@ void Voice::renderBlock()
     voiceValues.velocityLag.setTarget(voiceValues.velocity);
     voiceValues.velocityLag.process();
 
+    for (int m = 0; m < numMacros; ++m)
+    {
+        auto &mn = macroNode[m];
+        mn.macroPowerOn = mn.macroPowerV > 0.5f;
+        if (mn.macroPowerOn)
+        {
+            if (!mn.wasPowerOn)
+            {
+                mn.envAttack();
+                mn.lfoAttack();
+            }
+            mn.process();
+            voiceValues.macroOut[m] = mn.out;
+        }
+        else
+        {
+            voiceValues.macroOut[m] = *monoValues.macroPtr[m];
+        }
+        mn.wasPowerOn = mn.macroPowerOn;
+    }
+
     for (int i = 0; i < numOps; ++i)
     {
-        if (!src[i].active)
+        if (!src[i].active || !src[i].outputUsedCachedAtAttack)
         {
             src[i].clearOutputs();
             continue;
@@ -113,7 +225,8 @@ void Voice::renderBlock()
             auto pos = MatrixIndex::positionForSourceTarget(j, i);
             matrixNode[pos].applyBlock();
         }
-        selfNode[i].applyBlock();
+        if (!src[i].isAudioInCachedAtAttack)
+            selfNode[i].applyBlock();
         src[i].renderBlock();
         mixerNode[i].renderBlock();
     }
@@ -132,6 +245,8 @@ void Voice::renderBlock()
         }
         fadeBlocks--;
     }
+
+    voiceValues.firstBlockAfterAttack = false;
 }
 
 static_assert(numOps == 6, "Rebuild this table if not");
@@ -151,6 +266,11 @@ void Voice::retriggerAllEnvelopesForKeyPress()
                     (tm == TriggerMode::PATCH_DEFAULT && dtm == TriggerMode::KEY_PRESS));
         return res;
     };
+    for (auto &m : macroNode)
+        if (m.macroPowerOn)
+            if (mtm(m.triggerMode))
+                m.envAttack();
+
     for (auto &s : src)
         if (s.active)
             if (mtm(s.triggerMode))
@@ -198,6 +318,11 @@ void Voice::retriggerAllEnvelopesForReGate()
         return (tm != TriggerMode::NEW_VOICE);
     };
 
+    for (auto &m : macroNode)
+        if (m.macroPowerOn)
+            if (mtm(m.triggerMode))
+                m.envAttack();
+
     for (auto &s : src)
         if (s.active)
             if (mtm(s.triggerMode))
@@ -241,6 +366,15 @@ void Voice::cleanup()
     voiceValues.dPorta = 0;
     voiceValues.dPortaFrac = 0;
     voiceValues.mpeBendInSemis = 0;
+    voiceValues.mpeBendNormalized = 0;
+    voiceValues.mpeTimbre = 0;
+    voiceValues.mpeTimbreBipolar = 0;
+    voiceValues.mpePressure = 0;
+    voiceValues.noteExpressionTuningInSemis = 0;
+    voiceValues.noteExpressionPanBipolar = 0;
+
+    for (auto &m : macroNode)
+        m.envCleanup();
 
     for (auto &s : src)
     {

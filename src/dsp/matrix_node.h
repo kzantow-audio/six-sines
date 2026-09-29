@@ -39,14 +39,15 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
     const Patch::MatrixNode &matrixNode;
     const MonoValues &monoValues;
     const VoiceValues &voiceValues;
-    const float &level, &activeV, &modmodeV, &rmScaleV, &lfoToDepth, &envToLevel, &overdriveV;
+    const float &level, &activeV, &modmodeV, &rmScaleV, &lfoToDepth, &envToLevel, &overdriveV,
+        &lfoDepthMode;
     MatrixNodeFrom(const Patch::MatrixNode &mn, OpSource &on, OpSource &fr, MonoValues &mv,
                    const VoiceValues &vv)
         : matrixNode(mn), monoValues(mv), voiceValues(vv), onto(on), from(fr), level(mn.level),
           modmodeV(mn.modulationMode), activeV(mn.active), EnvelopeSupport(mn, mv, vv),
-          LFOSupport(mn, mv), lfoToDepth(mn.lfoToDepth), envToLevel(mn.envToLevel),
-          overdriveV(mn.overdrive), ModulationSupport(mn, this, mv, vv),
-          rmScaleV(mn.modulationScale)
+          LFOSupport(mn, mv, vv), lfoToDepth(mn.lfoToDepth), envToLevel(mn.envToLevel),
+          overdriveV(mn.overdrive), lfoDepthMode(mn.lfoDepthMode),
+          ModulationSupport(mn, this, mv, vv), rmScaleV(mn.modulationScale)
     {
     }
 
@@ -61,7 +62,7 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
         envResetMod();
         lfoResetMod();
 
-        active = activeV > 0.5;
+        active = activeV > 0.5 || monoValues.designModeRunAll;
 
         modMode = (int)std::round(modmodeV);
         rmScale = (int)std::round(rmScaleV);
@@ -87,7 +88,7 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
         calculateModulation();
         envProcess();
         lfoProcess();
-        float modlev alignas(16)[blockSize], mod alignas(16)[blockSize];
+        float modlev alignas(16)[blockSize];
 
         // Construct the level which is lfo * lev + env * lev or + env * dept + lev
         if (lfoIsEnveloped)
@@ -95,11 +96,33 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
             mech::scale_by<blockSize>(env.outputCache, lfo.outputBlock);
         }
 
-        auto l2d = lfoToDepth * lfoAtten;
-        static float la{-1111};
-        if (la != lfoAtten)
+        // LFO->Depth mode applied as base*lfoMul + lfoAdd (see MixerNode for the derivation),
+        // with depth d = lfoToDepth*lfoAtten. base is the non-LFO modulation depth.
+        auto d = lfoToDepth * lfoAtten;
+        float lfoMul alignas(16)[blockSize], lfoAdd alignas(16)[blockSize];
+        if (lfoDepthMode < 0.5f) // Add
         {
-            la = lfoAtten;
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f;
+                lfoAdd[j] = d * lfo.outputBlock[j];
+            }
+        }
+        else if (lfoDepthMode < 1.5f) // Scale
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f - d + d * lfo.outputBlock[j];
+                lfoAdd[j] = 0.f;
+            }
+        }
+        else // Atten
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f - d * lfo.outputBlock[j];
+                lfoAdd[j] = 0.f;
+            }
         }
 
         if (envIsMult)
@@ -107,7 +130,8 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
             auto e2d = level * depthAtten;
             for (int i = 0; i < blockSize; ++i)
             {
-                modlev[i] = applyMod + l2d * lfo.outputBlock[i] + e2d * env.outputCache[i];
+                auto base = applyMod + e2d * env.outputCache[i];
+                modlev[i] = base * lfoMul[i] + lfoAdd[i];
             }
         }
         else
@@ -115,12 +139,21 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
             auto e2d = envToLevel * depthAtten;
             for (int i = 0; i < blockSize; ++i)
             {
-                modlev[i] = applyMod + level + l2d * lfo.outputBlock[i] + e2d * env.outputCache[i];
+                auto base = applyMod + level + e2d * env.outputCache[i];
+                modlev[i] = base * lfoMul[i] + lfoAdd[i];
             }
         }
 
+        // Fused mul + apply. Earlier this was a two-pass:
+        //   mul_block(modlev, from.output, mod);            // SIMD write to mod[8]
+        //   for j: onto.X[j] += f(overdriveFactor * mod[j]); // scalar read back
+        // The fused form computes `modlev[j] * from.output[j]` inline and never
+        // materializes `mod[]`. Parens kept so the multiply order matches the
+        // original (`overdriveFactor * (modlev * fromOut)`) — bit-exact output.
         if (modMode == 1)
         {
+            // the mixer dc blocks a ring modulated op
+            onto.rmAssigned = true;
             // we want op * ( 1 - depth ) + op * rm * depth or
             // op * ( 1 + depth ( rm - 1 ) )
             // since the multiplier of depth is rmLevel and it starts at one that means
@@ -149,28 +182,27 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
         else if (modMode == 2)
         {
             // linear FM. -1..1 with a 10x ocerdrivce
-            mech::mul_block<blockSize>(modlev, from.output, mod);
             for (int j = 0; j < blockSize; ++j)
             {
-                onto.fmAmount[j] += (overdriveFactor * mod[j]);
+                onto.fmAmount[j] += (overdriveFactor * (modlev[j] * from.output[j]));
             }
         }
         else if (modMode == 3)
         {
             // expoential fm. if mod is 0...1 the result is 2^mod - 1
-            mech::mul_block<blockSize>(modlev, from.output, mod);
             for (int j = 0; j < blockSize; ++j)
             {
-                onto.fmAmount[j] += monoValues.twoToTheX.twoToThe(overdriveFactor * mod[j]) - 1.0;
+                onto.fmAmount[j] +=
+                    monoValues.twoToTheX.twoToThe(overdriveFactor * (modlev[j] * from.output[j])) -
+                    1.0;
             }
         }
         else
         {
-            mech::mul_block<blockSize>(modlev, from.output, mod);
-
             for (int j = 0; j < blockSize; ++j)
             {
-                onto.phaseInput[j] += (int32_t)((1 << 27) * (overdriveFactor * mod[j]));
+                onto.phaseInput[j] +=
+                    (int32_t)((1 << 27) * (overdriveFactor * (modlev[j] * from.output[j])));
             }
         }
     }
@@ -189,12 +221,13 @@ struct MatrixNodeFrom : public EnvelopeSupport<Patch::MatrixNode>,
 
     void calculateModulation()
     {
+        // attack left these reset, and nothing but a source changes them
+        if (!anySources)
+            return;
+
         resetModulation();
         envResetMod();
         lfoResetMod();
-
-        if (!anySources)
-            return;
 
         for (int i = 0; i < numModsPer; ++i)
         {
@@ -244,11 +277,12 @@ struct MatrixNodeSelf : EnvelopeSupport<Patch::SelfNode>,
     const MonoValues &monoValues;
     const VoiceValues &voiceValues;
 
-    const float &fbBase, &lfoToFB, &activeV, &envToFB, &overdriveV;
+    const float &fbBase, &lfoToFB, &activeV, &envToFB, &overdriveV, &lfoFBMode;
     MatrixNodeSelf(const Patch::SelfNode &sn, OpSource &on, MonoValues &mv, const VoiceValues &vv)
         : selfNode(sn), monoValues(mv), voiceValues(vv), onto(on), fbBase(sn.fbLevel),
           lfoToFB(sn.lfoToFB), activeV(sn.active), envToFB(sn.envToFB), overdriveV(sn.overdrive),
-          EnvelopeSupport(sn, mv, vv), LFOSupport(sn, mv), ModulationSupport(sn, this, mv, vv){};
+          lfoFBMode(sn.lfoFBMode), EnvelopeSupport(sn, mv, vv), LFOSupport(sn, mv, vv),
+          ModulationSupport(sn, this, mv, vv) {};
     bool active{true}, lfoMul{false};
     float overdriveFactor{1.0};
 
@@ -258,7 +292,7 @@ struct MatrixNodeSelf : EnvelopeSupport<Patch::SelfNode>,
         envResetMod();
         lfoResetMod();
 
-        active = activeV > 0.5;
+        active = activeV > 0.5 || monoValues.designModeRunAll;
         if (active)
         {
             bindModulation();
@@ -283,7 +317,34 @@ struct MatrixNodeSelf : EnvelopeSupport<Patch::SelfNode>,
 
         float modlev alignas(16)[blockSize];
 
-        auto l2f = lfoToFB * lfoAtten;
+        // LFO->FB mode applied as base*lfoMul + lfoAdd (see MixerNode for the derivation),
+        // with depth d = lfoToFB*lfoAtten. base is the non-LFO feedback level.
+        auto d = lfoToFB * lfoAtten;
+        float lfoMul alignas(16)[blockSize], lfoAdd alignas(16)[blockSize];
+        if (lfoFBMode < 0.5f) // Add
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f;
+                lfoAdd[j] = d * lfo.outputBlock[j];
+            }
+        }
+        else if (lfoFBMode < 1.5f) // Scale
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f - d + d * lfo.outputBlock[j];
+                lfoAdd[j] = 0.f;
+            }
+        }
+        else // Atten
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f - d * lfo.outputBlock[j];
+                lfoAdd[j] = 0.f;
+            }
+        }
 
         if (envIsMult)
         {
@@ -291,7 +352,8 @@ struct MatrixNodeSelf : EnvelopeSupport<Patch::SelfNode>,
 
             for (int i = 0; i < blockSize; ++i)
             {
-                modlev[i] = l2f * lfo.outputBlock[i] + e2f * env.outputCache[i] + fbMod;
+                auto base = e2f * env.outputCache[i] + fbMod;
+                modlev[i] = base * lfoMul[i] + lfoAdd[i];
             }
         }
         else
@@ -300,13 +362,18 @@ struct MatrixNodeSelf : EnvelopeSupport<Patch::SelfNode>,
 
             for (int i = 0; i < blockSize; ++i)
             {
-                modlev[i] = fbBase + l2f * lfo.outputBlock[i] + e2f * env.outputCache[i] + fbMod;
+                auto base = fbBase + e2f * env.outputCache[i] + fbMod;
+                modlev[i] = base * lfoMul[i] + lfoAdd[i];
             }
         }
+        int32_t anyFeedback{0};
         for (int j = 0; j < blockSize; ++j)
         {
             onto.feedbackLevel[j] = (int32_t)((1 << 24) * modlev[j] * overdriveFactor);
+            anyFeedback |= onto.feedbackLevel[j];
         }
+        // feedback that is zero all block adds nothing, so the op can skip the serial fb chain
+        onto.hasActiveFeedback = anyFeedback != 0;
     }
 
     float fbMod{0.f};
@@ -321,12 +388,13 @@ struct MatrixNodeSelf : EnvelopeSupport<Patch::SelfNode>,
     }
     void calculateModulation()
     {
+        // attack left these reset, and nothing but a source changes them
+        if (!anySources)
+            return;
+
         resetModulation();
         envResetMod();
         lfoResetMod();
-
-        if (!anySources)
-            return;
 
         for (int i = 0; i < numModsPer; ++i)
         {
@@ -379,19 +447,21 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
     const MonoValues &monoValues;
     const VoiceValues &voiceValues;
 
-    const float &level, &activeF, &pan, &lfoToLevel, &lfoToPan, &envToLevel;
+    const float &level, &activeF, &pan, &lfoToLevel, &lfoToPan, &envToLevel, &lfoLevelMode;
     bool active{false};
 
     MixerNode(const Patch::MixerNode &mn, OpSource &f, MonoValues &mv, const VoiceValues &vv)
         : mixerNode(mn), monoValues(mv), voiceValues(vv), from(f), pan(mn.pan), level(mn.level),
           activeF(mn.active), lfoToLevel(mn.lfoToLevel), lfoToPan(mn.lfoToPan),
-          envToLevel(mn.envToLevel), EnvelopeSupport(mn, mv, vv), LFOSupport(mn, mv),
-          ModulationSupport(mn, this, mv, vv)
+          envToLevel(mn.envToLevel), lfoLevelMode(mn.lfoLevelMode), EnvelopeSupport(mn, mv, vv),
+          LFOSupport(mn, mv, vv), ModulationSupport(mn, this, mv, vv)
     {
         memset(output, 0, sizeof(output));
     }
 
-    float doBlock{false};
+    bool doBlock{false};
+    // 1.2 never dc blocked a ring modulated op, since nothing set rmAssigned
+    bool blockRmCachedAtAttack{true};
     sst::basic_blocks::dsp::DCBlocker<blockSize> dcBlocker;
 
     void attack()
@@ -400,7 +470,7 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
         envResetMod();
         lfoResetMod();
 
-        active = activeF > 0.5;
+        active = activeF > 0.5 || monoValues.designModeRunAll;
         memset(output, 0, sizeof(output));
         if (active)
         {
@@ -411,13 +481,12 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
 
             dcBlocker.reset();
             memset(output, 0, sizeof(output));
+            blockRmCachedAtAttack = !monoValues.legacyDsp;
 
+            // set every attack: a voice that once played one of these must not keep blocking
             auto wf = (SinTable::WaveForm)(from.waveForm);
-            if (wf == SinTable::TX3 || wf == SinTable::TX4 || wf == SinTable::TX7 ||
-                wf == SinTable::TX8 || wf == SinTable::SPIKY_TX4 || wf == SinTable::SPIKY_TX8)
-            {
-                doBlock = true;
-            }
+            doBlock = wf == SinTable::TX3 || wf == SinTable::TX4 || wf == SinTable::TX7 ||
+                      wf == SinTable::TX8 || wf == SinTable::SPIKY_TX4 || wf == SinTable::SPIKY_TX8;
         }
     }
 
@@ -446,7 +515,7 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
 
         float dcValues alignas(16)[blockSize];
         float *useOut;
-        if (from.rmAssigned || doBlock)
+        if ((from.rmAssigned && blockRmCachedAtAttack) || doBlock)
         {
             dcBlocker.filter(from.output, dcValues);
             useOut = dcValues;
@@ -463,24 +532,54 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
 
         auto lv = std::clamp(level + levMod, 0.f, 1.f) * depthAtten;
 
+        // Precompute the LFO->Level contribution once (mode is constant across the block) so the
+        // sample loop is branch-free. Express every mode as amp * lfoMul[j] + lfoAdd[j], with
+        // depth d = lfoAtten*lfoToLevel:
+        //   Add:   amp + d*l            -> mul = 1,           add = d*l
+        //   Scale: amp * (1 - d + d*l)  -> mul = 1 - d + d*l, add = 0   (amp at l=+1, (1-d)amp at
+        //   l=0) Atten: amp * (1 - d*l)      -> mul = 1 - d*l,     add = 0   (amp at l=0,  (1-d)amp
+        //   at l=+1)
+        auto d = lfoAtten * lfoToLevel;
+        float lfoMul alignas(16)[blockSize], lfoAdd alignas(16)[blockSize];
+        if (lfoLevelMode < 0.5f) // Add
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f;
+                lfoAdd[j] = d * lfo.outputBlock[j];
+            }
+        }
+        else if (lfoLevelMode < 1.5f) // Scale
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f - d + d * lfo.outputBlock[j];
+                lfoAdd[j] = 0.f;
+            }
+        }
+        else // Atten
+        {
+            for (int j = 0; j < blockSize; ++j)
+            {
+                lfoMul[j] = 1.f - d * lfo.outputBlock[j];
+                lfoAdd[j] = 0.f;
+            }
+        }
+
         if (envIsMult)
         {
             for (int j = 0; j < blockSize; ++j)
             {
-                // use mech blah
                 auto amp = lv * env.outputCache[j];
-                amp += lfoAtten * lfoToLevel * lfo.outputBlock[j];
-                vSum[j] = amp * useOut[j];
+                vSum[j] = (amp * lfoMul[j] + lfoAdd[j]) * useOut[j];
             }
         }
         else
         {
             for (int j = 0; j < blockSize; ++j)
             {
-                // use mech blah
                 auto amp = lv + envToLevel * env.outputCache[j];
-                amp += lfoAtten * lfoToLevel * lfo.outputBlock[j];
-                vSum[j] = amp * useOut[j];
+                vSum[j] = (amp * lfoMul[j] + lfoAdd[j]) * useOut[j];
             }
         }
 
@@ -491,8 +590,11 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
         if (pn != 0.f)
         {
             pn = (pn + 1) * 0.5;
-            sdsp::pan_laws::panmatrix_t pmat;
-            sdsp::pan_laws::monoEqualPower(pn, pmat);
+            if (pn != panLawFor)
+            {
+                panLawFor = pn;
+                sdsp::pan_laws::monoEqualPower(pn, pmat);
+            }
 
             mech::mul_block<blockSize>(vSum, pmat[0], output[0]);
             mech::mul_block<blockSize>(vSum, pmat[3], output[1]);
@@ -517,6 +619,10 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
     float lfoPanAtten{1.0};
     float panMod{0.0};
 
+    // the pan law costs a sin and cos; the pan is usually constant across a note
+    float panLawFor{-1.f};
+    sdsp::pan_laws::panmatrix_t pmat{};
+
     void resetModulation()
     {
         depthAtten = 1.f;
@@ -528,12 +634,13 @@ struct MixerNode : EnvelopeSupport<Patch::MixerNode>,
 
     void calculateModulation()
     {
+        // attack left these reset, and nothing but a source changes them
+        if (!anySources)
+            return;
+
         resetModulation();
         envResetMod();
         lfoResetMod();
-
-        if (!anySources)
-            return;
 
         for (int i = 0; i < numModsPer; ++i)
         {
@@ -594,7 +701,7 @@ struct MainPanNode : EnvelopeSupport<Patch::MainPanNode>,
     const float &lfoD, &envD;
 
     MainPanNode(const Patch::MainPanNode &mn, MonoValues &mv, const VoiceValues &vv)
-        : ModulationSupport(mn, this, mv, vv), EnvelopeSupport(mn, mv, vv), LFOSupport(mn, mv),
+        : ModulationSupport(mn, this, mv, vv), EnvelopeSupport(mn, mv, vv), LFOSupport(mn, mv, vv),
           modNode(mn), monoValues(mv), voiceValues(vv), lfoD(mn.lfoDepth), envD(mn.envDepth)
     {
     }
@@ -666,12 +773,13 @@ struct MainPanNode : EnvelopeSupport<Patch::MainPanNode>,
     }
     void calculateModulation()
     {
+        // attack left these reset, and nothing but a source changes them
+        if (!anySources)
+            return;
+
         resetModulation();
         envResetMod();
         lfoResetMod();
-
-        if (!anySources)
-            return;
 
         for (int i = 0; i < numModsPer; ++i)
         {
@@ -734,7 +842,7 @@ struct FineTuneNode : EnvelopeSupport<Patch::FineTuneNode>,
     const float &lfoD, &envD, &coarseTune, &lfoCoarseD, &envCoarseD;
 
     FineTuneNode(const Patch::FineTuneNode &mn, MonoValues &mv, const VoiceValues &vv)
-        : ModulationSupport(mn, this, mv, vv), EnvelopeSupport(mn, mv, vv), LFOSupport(mn, mv),
+        : ModulationSupport(mn, this, mv, vv), EnvelopeSupport(mn, mv, vv), LFOSupport(mn, mv, vv),
           coarseTune(mn.coarseTune), modNode(mn), monoValues(mv), voiceValues(vv),
           lfoD(mn.lfoDepth), envD(mn.envDepth), lfoCoarseD(mn.lfoCoarseDepth),
           envCoarseD(mn.envCoarseDepth)
@@ -816,12 +924,13 @@ struct FineTuneNode : EnvelopeSupport<Patch::FineTuneNode>,
     }
     void calculateModulation()
     {
+        // attack left these reset, and nothing but a source changes them
+        if (!anySources)
+            return;
+
         resetModulation();
         envResetMod();
         lfoResetMod();
-
-        if (!anySources)
-            return;
 
         for (int i = 0; i < numModsPer; ++i)
         {
@@ -886,6 +995,7 @@ struct OutputNode : EnvelopeSupport<Patch::OutputNode>,
 
     const float &level, &velSen, &bendUp, &bendDown, &octTranspose, &pan, &fineTune, &lfoDepth;
     const float &defTrigV;
+    const float &legacyDspV;
     TriggerMode defaultTrigger;
 
     MainPanNode panModNode;
@@ -897,8 +1007,9 @@ struct OutputNode : EnvelopeSupport<Patch::OutputNode>,
         : outputNode(on), ModulationSupport(on, this, mv, vv), monoValues(mv), voiceValues(vv),
           fromArr(f), level(on.level), bendUp(on.bendUp), bendDown(on.bendDown),
           octTranspose(on.octTranspose), velSen(on.velSensitivity), EnvelopeSupport(on, mv, vv),
-          LFOSupport(on, mv), defTrigV(on.defaultTrigger), pan(on.pan), fineTune(on.fineTune),
-          lfoDepth(on.lfoDepth), ftModNode(ftMN, mv, vv), panModNode(panMN, mv, vv)
+          LFOSupport(on, mv, vv), defTrigV(on.defaultTrigger), pan(on.pan), fineTune(on.fineTune),
+          lfoDepth(on.lfoDepth), legacyDspV(on.legacyDsp), ftModNode(ftMN, mv, vv),
+          panModNode(panMN, mv, vv)
     {
         memset(output, 0, sizeof(output));
         allowVoiceTrigger = false;
@@ -925,6 +1036,9 @@ struct OutputNode : EnvelopeSupport<Patch::OutputNode>,
     void renderBlock()
     {
         calculateModulation();
+        // 1.2 patches were voiced through the comb this leaves behind
+        if (legacyDspV < 0.5f)
+            memset(output, 0, sizeof(output));
         for (const auto &from : fromArr)
         {
             if (from.from.operatorOutputsToMain)
@@ -959,14 +1073,17 @@ struct OutputNode : EnvelopeSupport<Patch::OutputNode>,
 
         mech::scale_by<blockSize>(finalEnvLevel, output[0], output[1]);
 
-        auto pn = std::clamp(panMod + pan + panModNode.level + voiceValues.noteExpressionPanBipolar,
-                             -1.f, 1.f);
+        auto pn = std::clamp(
+            panMod + pan + panModNode.level + voiceValues.noteExpressionPanBipolarLag.v, -1.f, 1.f);
         ;
         if (pn != 0.f)
         {
             pn = (pn + 1) * 0.5;
-            sdsp::pan_laws::panmatrix_t pmat;
-            sdsp::pan_laws::stereoEqualPower(pn, pmat);
+            if (pn != panLawFor)
+            {
+                panLawFor = pn;
+                sdsp::pan_laws::stereoEqualPower(pn, pmat);
+            }
 
             for (int i = 0; i < blockSize; ++i)
             {
@@ -994,6 +1111,10 @@ struct OutputNode : EnvelopeSupport<Patch::OutputNode>,
     float depthAtten{1.0};
     float lfoAtten{1.0};
 
+    // the pan law costs a sin and cos; the pan is usually constant across a note
+    float panLawFor{-1.f};
+    sdsp::pan_laws::panmatrix_t pmat{};
+
     void resetModulation()
     {
         depthAtten = 1.f;
@@ -1003,12 +1124,13 @@ struct OutputNode : EnvelopeSupport<Patch::OutputNode>,
     }
     void calculateModulation()
     {
+        // attack left these reset, and nothing but a source changes them
+        if (!anySources)
+            return;
+
         resetModulation();
         envResetMod();
         lfoResetMod();
-
-        if (!anySources)
-            return;
 
         for (int i = 0; i < numModsPer; ++i)
         {

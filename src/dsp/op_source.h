@@ -22,10 +22,14 @@
 #include "configuration.h"
 
 #include "dsp/sintable.h"
+#include "dsp/wavetable.h"
 #include "dsp/node_support.h"
 #include "synth/patch.h"
 #include "synth/mono_values.h"
 #include "synth/voice_values.h"
+#include "remap_functions.h"
+#include "resonant_window.h"
+#include "noise_helper.h"
 
 namespace baconpaul::six_sines
 {
@@ -38,6 +42,13 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
     float rmLevel alignas(16)[blockSize];
     float fmAmount alignas(16)[blockSize]; // in hz
     bool rmAssigned{false};
+    // Per-block signal from MatrixNodeSelf::applyBlock: true when some feedbackLevel[]
+    // is non-zero this block. The inner-loop
+    // dispatcher uses this to pick a no-FB template instantiation that skips the
+    // feedback math AND the fbv[] shift entirely — removing the per-sample
+    // backward dependency unlocks a lot more compiler reordering.
+    bool hasActiveFeedback{false};
+    int opIndex{0}; // set by Voice constructor; 0 = op1 which can use AUDIO_IN
 
     float output alignas(16)[blockSize];
 
@@ -49,25 +60,104 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
     const float &ratio, &activeV, &envToRatio, &lfoToRatio, &envToRatioFine,
         &lfoToRatioFine; // in  frequency multiple
     const float &waveForm, &kt, &ktv, &ktlo, &ktlov, &startPhase, &octTranspose; // in octaves;
+    const float &absOffset;                                                      // in Hz
     bool active{false};
     bool unisonParticipatesPan{true}, unisonParticipatesTune{true};
     bool operatorOutputsToMain{true}, operatorOutputsToOp{true};
+    // false when no mixer or live route reads this op, so the voice skips rendering it
+    bool outputUsedCachedAtAttack{true};
 
     // todo waveshape
 
-    uint32_t phase;
-    int32_t dPhase;
+    uint32_t phase{0};
+    int32_t dPhase{0};
 
     static constexpr float centsScale{1.0 / (12 * 100)};
 
+    // Latch-at-attack cache. The dispatch in innerLoop() and the AUDIO_IN check
+    // in renderBlock() used to round+cast the patch .value every block. They
+    // read these typed members instead, which are populated by cacheEnums() in
+    // reset() and stay stable for the life of the note. Mid-note mode changes
+    // don't take effect until retrigger — same as the heavy state (stWindow,
+    // extendedLagM/N) already did.
+    SinTable::WaveForm waveFormCachedAtAttack{SinTable::SIN};
+    bool isAudioInCachedAtAttack{false};
+    // Which table this note reads, latched with everything else at attack. The pointer is
+    // held for the life of the note so a main-thread swap cannot pull it out from under us.
+    bool usesWavetableCachedAtAttack{false};
+    Patch::SourceNode::ExtendedMode extendedModeCachedAtAttack{
+        Patch::SourceNode::ExtendedMode::NONE};
+    Patch::SourceNode::PhaseMapShape phaseMapShapeCachedAtAttack{
+        Patch::SourceNode::PhaseMapShape::SAW};
+    // post-remap read offset; lets you read a cosine (or any rotation) through the map
+    uint32_t phaseMapReadPhaseCachedAtAttack{0};
+    Patch::SourceNode::ResonantSweepWindow resonantSweepWindowCachedAtAttack{
+        Patch::SourceNode::ResonantSweepWindow::SAW};
+    Patch::SourceNode::NoiseMode noiseModeCachedAtAttack{
+        Patch::SourceNode::NoiseMode::ADD_TO_PHASE};
+    Patch::SourceNode::NoiseType noiseTypeCachedAtAttack{Patch::SourceNode::NoiseType::PINK};
+    Patch::SourceNode::LFSRMode lfsrModeCachedAtAttack{Patch::SourceNode::LFSRMode::LONG_KEYTRACK};
+    float resonantSweepKScaleCachedAtAttack{1.0f};
+    bool legacyDspCachedAtAttack{false};
+
+    void cacheEnums()
+    {
+        using EM = Patch::SourceNode::ExtendedMode;
+        using PM = Patch::SourceNode::PhaseMapShape;
+        using RW = Patch::SourceNode::ResonantSweepWindow;
+        using RFD = Patch::SourceNode::ResonantSweepFrequencyDepth;
+        using NM = Patch::SourceNode::NoiseMode;
+        using NT = Patch::SourceNode::NoiseType;
+        using LM = Patch::SourceNode::LFSRMode;
+
+        waveFormCachedAtAttack =
+            static_cast<SinTable::WaveForm>(static_cast<uint32_t>(std::round(waveForm)));
+        isAudioInCachedAtAttack = (waveFormCachedAtAttack == SinTable::AUDIO_IN);
+        legacyDspCachedAtAttack = monoValues.legacyDsp;
+
+        extendedModeCachedAtAttack =
+            static_cast<EM>(static_cast<uint32_t>(std::round(sourceNode.extendedModeMode.value)));
+        phaseMapShapeCachedAtAttack =
+            static_cast<PM>(static_cast<uint32_t>(std::round(sourceNode.phaseMapModeShape.value)));
+        phaseMapReadPhaseCachedAtAttack =
+            static_cast<uint32_t>((1 << 26) * sourceNode.phaseMapReadPhase.value);
+        resonantSweepWindowCachedAtAttack = static_cast<RW>(
+            static_cast<uint32_t>(std::round(sourceNode.resonantSweepWindowShape.value)));
+
+        auto rfd = static_cast<RFD>(
+            static_cast<uint32_t>(std::round(sourceNode.resonantSweepFrequencyDepth.value)));
+        switch (rfd)
+        {
+        case RFD::TWO:
+            resonantSweepKScaleCachedAtAttack = 2.0f;
+            break;
+        case RFD::FOUR:
+            resonantSweepKScaleCachedAtAttack = 4.0f;
+            break;
+        case RFD::TEN:
+            resonantSweepKScaleCachedAtAttack = 10.0f;
+            break;
+        }
+
+        usesWavetableCachedAtAttack = (waveFormCachedAtAttack == SinTable::USER_TABLE);
+
+        noiseModeCachedAtAttack =
+            static_cast<NM>(static_cast<uint32_t>(std::round(sourceNode.noiseMode.value)));
+        noiseTypeCachedAtAttack =
+            static_cast<NT>(static_cast<uint32_t>(std::round(sourceNode.noiseType.value)));
+        lfsrModeCachedAtAttack =
+            static_cast<LM>(static_cast<uint32_t>(std::round(sourceNode.lfsrMode.value)));
+    }
+
     OpSource(const Patch::SourceNode &sn, MonoValues &mv, const VoiceValues &vv)
         : sourceNode(sn), monoValues(mv), voiceValues(vv), EnvelopeSupport(sn, mv, vv),
-          LFOSupport(sn, mv), ModulationSupport(sn, this, mv, vv), ratio(sn.ratio),
+          LFOSupport(sn, mv, vv), ModulationSupport(sn, this, mv, vv), ratio(sn.ratio),
           activeV(sn.active), envToRatio(sn.envToRatio), lfoToRatio(sn.lfoToRatio),
           waveForm(sn.waveForm), kt(sn.keyTrack), ktv(sn.keyTrackValue),
           ktlo(sn.keyTrackValueIsLow), ktlov(sn.keyTrackLowFrequencyValue),
-          startPhase(sn.startingPhase), octTranspose(sn.octTranspose),
-          lfoToRatioFine(sn.lfoToRatioFine), envToRatioFine(sn.envToRatioFine)
+          startPhase(sn.startingPhase), octTranspose(sn.octTranspose), absOffset(sn.absoluteOffset),
+          lfoToRatioFine(sn.lfoToRatioFine), envToRatioFine(sn.envToRatioFine),
+          noiseHelper(mv.rng, mv.dbToLinear)
     {
         reset();
     }
@@ -81,8 +171,59 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
         envResetMod();
         lfoResetMod();
 
+        // Latch all mode/shape enums up front; reset() and renderBlock() / innerLoop()
+        // both read the cached typed members from here on.
+        cacheEnums();
+
         st.setSampleRate(monoValues.sr.sampleRate);
+        stWindow.setSampleRate(monoValues.sr.sampleRate);
+        // Pick the table for the resonant-sweep window. BLACKMAN_HARRIS and TUKEY pull
+        // their own tables; everything else (closed-form windows + HANN) defaults to
+        // HANN so a mid-note shape change doesn't read a stale unrelated table — the
+        // closed-form arms in the inner loop don't read stWindow at all.
+        {
+            using RW = Patch::SourceNode::ResonantSweepWindow;
+            switch (resonantSweepWindowCachedAtAttack)
+            {
+            case RW::BLACKMAN_HARRIS:
+                stWindow.setWaveForm(SinTable::BLACKMAN_HARRIS_WINDOW, legacyDspCachedAtAttack);
+                break;
+            case RW::TUKEY:
+                stWindow.setWaveForm(SinTable::TUKEY_WINDOW, legacyDspCachedAtAttack);
+                break;
+            default:
+                stWindow.setWaveForm(SinTable::HANN_WINDOW, legacyDspCachedAtAttack);
+                break;
+            }
+        }
         firstTime = true;
+        extendedMPrior = sourceNode.extendedModeM.value;
+        morphPrior = sourceNode.wavetableMorph.value;
+        if (usesWavetableCachedAtAttack)
+        {
+            morphLag.setRateInMilliseconds(10, monoValues.sr.samplerate, blockSizeInv);
+            morphLag.snapTo(sourceNode.wavetableMorph.value);
+        }
+        // Configure the M/N lags only if the operator is actually using an extended mode
+        // that consumes them. In NONE the lag members exist but are never touched.
+        {
+            using EM = Patch::SourceNode::ExtendedMode;
+            if (extendedModeCachedAtAttack == EM::PHASE_REMAP ||
+                extendedModeCachedAtAttack == EM::RESONANT_SWEEP ||
+                extendedModeCachedAtAttack == EM::NOISE)
+            {
+                extendedLagM.setRateInMilliseconds(10, monoValues.sr.samplerate, blockSizeInv);
+                extendedLagM.snapTo(sourceNode.extendedModeM.value);
+            }
+            if (extendedModeCachedAtAttack == EM::NOISE)
+            {
+                extendedLagN.setRateInMilliseconds(10, monoValues.sr.samplerate, blockSizeInv);
+                extendedLagN.snapTo(sourceNode.extendedModeN.value);
+            }
+        }
+        noiseHelper.setSampleRate(monoValues.sr.sampleRate);
+        noiseHelper.warmup();
+        noisePos = 16;
         zeroInputs();
         snapActive();
 
@@ -97,8 +238,7 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
             resetPhaseOnly();
             fbVal[0] = 0.f;
             fbVal[1] = 0.f;
-            auto wf = (SinTable::WaveForm)std::round(waveForm);
-            st.setWaveForm(wf);
+            bindWavetable();
 
             if (lfoIsEnveloped)
             {
@@ -147,6 +287,19 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
         used = used || (lfoToRatio != 0);
         used = used || (lfoToRatioFine != 0);
 
+        // Extended-mode targets — only consume the LFO when the mode that uses them is active.
+        using EM = Patch::SourceNode::ExtendedMode;
+        if (extendedModeCachedAtAttack == EM::PHASE_REMAP ||
+            extendedModeCachedAtAttack == EM::RESONANT_SWEEP ||
+            extendedModeCachedAtAttack == EM::NOISE)
+            used = used || (sourceNode.lfoToExtendedModeM.value != 0);
+        if (extendedModeCachedAtAttack == EM::NOISE)
+            used = used || (sourceNode.lfoToExtendedModeN.value != 0);
+
+        // Same rule for morph: only when this operator is actually reading a wavetable
+        if (usesWavetableCachedAtAttack)
+            used = used || (sourceNode.lfoToWavetableMorph.value != 0);
+
         return used;
     }
 
@@ -171,11 +324,12 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
             fmAmount[i] = 0.f;
         }
         rmAssigned = false;
+        hasActiveFeedback = false;
     }
 
     void clearOutputs() { memset(output, 0, sizeof(output)); }
 
-    void snapActive() { active = activeV > 0.5; }
+    void snapActive() { active = activeV > 0.5 || monoValues.designModeRunAll; }
 
     float baseFrequency{0};
     void setBaseFrequency(float freq, float octFac)
@@ -203,6 +357,14 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
     float lfoRatioAtten{1.0};
     float phaseMod{0.f};
     float priorRF{0.f};
+    float extendedMPrior{0.f};
+    float extendedMMod{0.f}, extendedNMod{0.f};
+    float morphPrior{0.f};
+    float morphMod{0.f};
+
+    // Per-block one-pole smoothers for extended-mode M and N. Unlike the LFO smoother
+    // these are *required* in extended mode — M/N have jumps would alias loudly.
+    sst::basic_blocks::dsp::OnePoleLag<float, false> extendedLagM, extendedLagN, morphLag;
 
     bool firstTime{true};
     void renderBlock()
@@ -212,6 +374,21 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
             memset(output, 0, sizeof(output));
             fbVal[0] = 0.f;
             fbVal[1] = 0.f;
+            return;
+        }
+
+        if (isAudioInCachedAtAttack)
+        {
+            if (opIndex == 0)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                    output[i] = monoValues.audioInBlock[i];
+            }
+            else
+            {
+                memset(output, 0, sizeof(output));
+            }
+            fbVal[0] = fbVal[1] = 0.f;
             return;
         }
 
@@ -236,7 +413,7 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
         if (firstTime)
             priorRF = rf;
         firstTime = false;
-        auto dRF = (priorRF - rf) / blockSize;
+        auto dRF = (rf - priorRF) / blockSize;
         std::swap(rf, priorRF);
 
         if (softResetPhaseCount > 0)
@@ -269,8 +446,8 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
     static constexpr int softPhaseCount{16};
     static constexpr float dSoftPhase{1.f / (blockSize * softPhaseCount)};
     int softResetPhaseCount{-1};
-    uint32_t softPhase;
-    float softFb[2];
+    uint32_t softPhase{0};
+    float softFb[2]{0.f, 0.f};
     void softResetPhase()
     {
         softPhase = 4 << 27;
@@ -279,29 +456,399 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
         softResetPhaseCount = softPhaseCount;
     }
 
+    // a block whose feedback keeps one sign has a shorter exact form, chosen as a template
+    // argument so no compiler is left to split, or select inside, the sample loop
+    enum FbMode
+    {
+        FB_OFF,
+        FB_POSITIVE,
+        FB_NEGATIVE,
+        FB_MIXED
+    };
+
     void innerLoop(float *onto, float *fbv, float rf, const float dRF, uint32_t &phs)
     {
+        // Split on per-block self-feedback so we pick the right template
+        // instantiation of innerLoopImpl. The flag is set by
+        // MatrixNodeSelf::applyBlock and stays false when self-FB is off for
+        // this op (the common case for modulator stacks) — the FB_OFF
+        // path then skips the feedback math entirely.
+        if (!hasActiveFeedback)
+        {
+            innerLoopForFb<FB_OFF>(onto, fbv, rf, dRF, phs);
+            return;
+        }
+        bool allPositive{true}, allNegative{true};
         for (int i = 0; i < blockSize; ++i)
         {
-            dPhase = st.dPhase((baseFrequency * (1.0 + fmAmount[i])) * rf);
+            allPositive = allPositive && feedbackLevel[i] >= 0;
+            allNegative = allNegative && feedbackLevel[i] < 0;
+        }
+        if (allPositive)
+            innerLoopForFb<FB_POSITIVE>(onto, fbv, rf, dRF, phs);
+        else if (allNegative)
+            innerLoopForFb<FB_NEGATIVE>(onto, fbv, rf, dRF, phs);
+        else
+            innerLoopForFb<FB_MIXED>(onto, fbv, rf, dRF, phs);
+    }
+
+    template <FbMode FB>
+    void innerLoopForFb(float *onto, float *fbv, float rf, const float dRF, uint32_t &phs)
+    {
+        if (usesWavetableCachedAtAttack)
+            innerLoopDispatch<FB, true>(onto, fbv, rf, dRF, phs);
+        else
+            innerLoopDispatch<FB, false>(onto, fbv, rf, dRF, phs);
+    }
+
+    template <FbMode FB, bool IsWT>
+    void innerLoopDispatch(float *onto, float *fbv, float rf, const float dRF, uint32_t &phs)
+    {
+        using EM = Patch::SourceNode::ExtendedMode;
+        using PM = Patch::SourceNode::PhaseMapShape;
+        switch (extendedModeCachedAtAttack)
+        {
+        case EM::NONE:
+            innerLoopImpl<FB, IsWT, EM::NONE>(onto, fbv, rf, dRF, phs);
+            break;
+        case EM::PHASE_REMAP:
+        {
+            switch (phaseMapShapeCachedAtAttack)
+            {
+            case PM::SAW:
+                innerLoopImpl<FB, IsWT, EM::PHASE_REMAP, PM::SAW>(onto, fbv, rf, dRF, phs);
+                break;
+            case PM::SQUARE:
+                innerLoopImpl<FB, IsWT, EM::PHASE_REMAP, PM::SQUARE>(onto, fbv, rf, dRF, phs);
+                break;
+            case PM::PULSE:
+                innerLoopImpl<FB, IsWT, EM::PHASE_REMAP, PM::PULSE>(onto, fbv, rf, dRF, phs);
+                break;
+            case PM::DOUBLE:
+                innerLoopImpl<FB, IsWT, EM::PHASE_REMAP, PM::DOUBLE>(onto, fbv, rf, dRF, phs);
+                break;
+            case PM::SIN_TO_SQUARE:
+                innerLoopImpl<FB, IsWT, EM::PHASE_REMAP, PM::SIN_TO_SQUARE>(onto, fbv, rf, dRF,
+                                                                            phs);
+                break;
+            case PM::DOUBLE_SAW:
+                innerLoopImpl<FB, IsWT, EM::PHASE_REMAP, PM::DOUBLE_SAW>(onto, fbv, rf, dRF, phs);
+                break;
+            }
+            break;
+        }
+        case EM::RESONANT_SWEEP:
+        {
+            using RW = Patch::SourceNode::ResonantSweepWindow;
+            // The PhaseMapShape template arg is unused on this branch; leave it at default.
+            switch (resonantSweepWindowCachedAtAttack)
+            {
+            case RW::SAW:
+                innerLoopImpl<FB, IsWT, EM::RESONANT_SWEEP, Patch::SourceNode::PhaseMapShape::SAW,
+                              RW::SAW>(onto, fbv, rf, dRF, phs, resonantSweepKScaleCachedAtAttack);
+                break;
+            case RW::TRIANGLE:
+                innerLoopImpl<FB, IsWT, EM::RESONANT_SWEEP, Patch::SourceNode::PhaseMapShape::SAW,
+                              RW::TRIANGLE>(onto, fbv, rf, dRF, phs,
+                                            resonantSweepKScaleCachedAtAttack);
+                break;
+            case RW::TRAPEZOID:
+                innerLoopImpl<FB, IsWT, EM::RESONANT_SWEEP, Patch::SourceNode::PhaseMapShape::SAW,
+                              RW::TRAPEZOID>(onto, fbv, rf, dRF, phs,
+                                             resonantSweepKScaleCachedAtAttack);
+                break;
+            case RW::FULLTRAP:
+                innerLoopImpl<FB, IsWT, EM::RESONANT_SWEEP, Patch::SourceNode::PhaseMapShape::SAW,
+                              RW::FULLTRAP>(onto, fbv, rf, dRF, phs,
+                                            resonantSweepKScaleCachedAtAttack);
+                break;
+            case RW::HANN:
+                innerLoopImpl<FB, IsWT, EM::RESONANT_SWEEP, Patch::SourceNode::PhaseMapShape::SAW,
+                              RW::HANN>(onto, fbv, rf, dRF, phs, resonantSweepKScaleCachedAtAttack);
+                break;
+            case RW::BLACKMAN_HARRIS:
+                innerLoopImpl<FB, IsWT, EM::RESONANT_SWEEP, Patch::SourceNode::PhaseMapShape::SAW,
+                              RW::BLACKMAN_HARRIS>(onto, fbv, rf, dRF, phs,
+                                                   resonantSweepKScaleCachedAtAttack);
+                break;
+            case RW::TUKEY:
+                innerLoopImpl<FB, IsWT, EM::RESONANT_SWEEP, Patch::SourceNode::PhaseMapShape::SAW,
+                              RW::TUKEY>(onto, fbv, rf, dRF, phs,
+                                         resonantSweepKScaleCachedAtAttack);
+                break;
+            }
+            break;
+        }
+        case EM::NOISE:
+        {
+            using NM = Patch::SourceNode::NoiseMode;
+            constexpr auto PMSAW = Patch::SourceNode::PhaseMapShape::SAW;
+            constexpr auto RWSAW = Patch::SourceNode::ResonantSweepWindow::SAW;
+            switch (noiseModeCachedAtAttack)
+            {
+            case NM::ADD_TO_PHASE:
+                innerLoopImpl<FB, IsWT, EM::NOISE, PMSAW, RWSAW, NM::ADD_TO_PHASE>(onto, fbv, rf,
+                                                                                   dRF, phs);
+                break;
+            case NM::ADD_TO_SIGNAL:
+                innerLoopImpl<FB, IsWT, EM::NOISE, PMSAW, RWSAW, NM::ADD_TO_SIGNAL>(onto, fbv, rf,
+                                                                                    dRF, phs);
+                break;
+            case NM::MIX_WITH_SIGNAL:
+                innerLoopImpl<FB, IsWT, EM::NOISE, PMSAW, RWSAW, NM::MIX_WITH_SIGNAL>(onto, fbv, rf,
+                                                                                      dRF, phs);
+                break;
+            case NM::MUL_BY_SIGNAL:
+                innerLoopImpl<FB, IsWT, EM::NOISE, PMSAW, RWSAW, NM::MUL_BY_SIGNAL>(onto, fbv, rf,
+                                                                                    dRF, phs);
+                break;
+            case NM::MUL_BY_UNI_SIGNAL:
+                innerLoopImpl<FB, IsWT, EM::NOISE, PMSAW, RWSAW, NM::MUL_BY_UNI_SIGNAL>(
+                    onto, fbv, rf, dRF, phs);
+                break;
+            }
+            break;
+        }
+        }
+    }
+
+    template <
+        FbMode FB, bool IsWT, Patch::SourceNode::ExtendedMode ET,
+        Patch::SourceNode::PhaseMapShape S = Patch::SourceNode::PhaseMapShape::SAW,
+        Patch::SourceNode::ResonantSweepWindow R = Patch::SourceNode::ResonantSweepWindow::SAW,
+        Patch::SourceNode::NoiseMode NM = Patch::SourceNode::NoiseMode::ADD_TO_PHASE>
+    void innerLoopImpl(float *onto, float *fbv, float rf, const float dRF, uint32_t &phs,
+                       float kScale = 1.0f)
+    {
+        using EM = Patch::SourceNode::ExtendedMode;
+        using NMode = Patch::SourceNode::NoiseMode;
+        using NT = Patch::SourceNode::NoiseType;
+        using LM = Patch::SourceNode::LFSRMode;
+
+        if constexpr (IsWT)
+        {
+            // Take the highest frequency the block will reach, so a rising ratio picks the
+            // coarser level a block early rather than a block late. Inbound FM is not in
+            // here: the instantaneous increment under audio rate modulation has nothing to
+            // do with the note, and chasing it would mean re-choosing per sample.
+            auto fMax = baseFrequency * std::max(rf, rf + dRF * blockSize) + std::fabs(absOffset);
+            wtReader.updateLevelForFrequency(fMax, static_cast<float>(monoValues.sr.sampleRate));
+        }
+
+        float nextMorph{0.f}, dMorph{0.f};
+        if constexpr (IsWT)
+        {
+            // Morph is a modulation target, so unlike the table itself it is live rather than
+            // latched. Same shape as extendedModeM: smooth the target, then walk linearly
+            // across the block so an audio rate modulator does not step.
+            auto lfoFac = *lfoFacP;
+            float target = sourceNode.wavetableMorph.value + morphMod +
+                           sourceNode.envToWavetableMorph.value * env.outputCache[blockSize - 1] +
+                           lfoFac * sourceNode.lfoToWavetableMorph.value * lfo.outputBlock[0];
+            morphLag.setTarget(std::clamp(target, 0.f, 1.f));
+            morphLag.process();
+            nextMorph = morphLag.v;
+            dMorph = (nextMorph - morphPrior) / blockSize;
+            std::swap(nextMorph, morphPrior);
+        }
+
+        float nextM{0.f}, dM{0.f};
+        float nextN{0.f};
+        NT noiseType{NT::PINK};
+        LM lfsrMode{LM::LONG_KEYTRACK};
+        if constexpr (ET == EM::PHASE_REMAP || ET == EM::RESONANT_SWEEP || ET == EM::NOISE)
+        {
+            // Raw target m for this block: patch value + external mod + env / lfo contributions.
+            auto lfoFac = *lfoFacP;
+            float target = sourceNode.extendedModeM.value + extendedMMod +
+                           sourceNode.envToExtendedModeM.value * env.outputCache[blockSize - 1] +
+                           lfoFac * sourceNode.lfoToExtendedModeM.value * lfo.outputBlock[0];
+            // Push through the one-pole smoother before the block-walk. M cannot tolerate
+            // jumps the way ratio can (the remap math hard-clamps the shape), so we always
+            // smooth here. Then walk linearly from prior block's smoothed value to this one.
+            extendedLagM.setTarget(target);
+            extendedLagM.process();
+            nextM = extendedLagM.v;
+            dM = (nextM - extendedMPrior) / blockSize;
+            std::swap(nextM, extendedMPrior);
+        }
+        if constexpr (ET == EM::NOISE)
+        {
+            auto lfoFac = *lfoFacP;
+            float targetN = sourceNode.extendedModeN.value + extendedNMod +
+                            sourceNode.envToExtendedModeN.value * env.outputCache[blockSize - 1] +
+                            lfoFac * sourceNode.lfoToExtendedModeN.value * lfo.outputBlock[0];
+            extendedLagN.setTarget(targetN);
+            extendedLagN.process();
+            nextN = extendedLagN.v;
+            noiseType = noiseTypeCachedAtAttack;
+            lfsrMode = lfsrModeCachedAtAttack;
+        }
+
+        // the loop state in locals, so phs and fbv are not stored and reloaded every sample
+        uint32_t phsL{phs};
+        int32_t dPhaseL{dPhase};
+        float fb0{fbv[0]}, fb1{fbv[1]};
+
+        for (int i = 0; i < blockSize; ++i)
+        {
+            dPhaseL = st.dPhase((baseFrequency * (1.0 + fmAmount[i])) * rf + absOffset);
             rf += dRF;
 
-            phs += dPhase;
-            auto fb = 0.5 * (fbv[0] + fbv[1]);
-            auto sb = std::signbit(feedbackLevel[i]);
-            // fb = sb ? fb * fb : fb. Ugh a branch. but bool = 0/1, so
-            // (1-sb) * fb + sb * fb * fb - 3 mul, 2 add
-            // fb - sb * fb + sb * fb * fb - 3 nul 2 add
-            // fb * ( 1 - sb * ( 1 - fb)) - 2 mul 2 add
-            fb = fb * (1 - sb * (1 - fb));
+            phsL += dPhaseL;
+            // When self-feedback is inactive for this block, skip the fb math
+            // entirely (constexpr-out). When active, use an int compare for the
+            // sign bit instead of std::signbit on int32_t — std::signbit's
+            // integral overload promotes to double per C++11 [c.math.fpclass],
+            // which is implementation-defined cost. `ph` then feeds every
+            // extended-mode transform downstream, so this gating must be at the
+            // top of the per-sample loop, not around EM::NONE only.
+            uint32_t ph{0};
+            if constexpr (FB != FB_OFF)
+            {
+                if constexpr (FB == FB_POSITIVE)
+                {
+                    // the value the general form gives: 1 - 0 * x is exactly 1 and halving is
+                    // exact, so both round the same exact product once
+                    ph = phsL + phaseInput[i] +
+                         (int32_t)((double)(fb0 + fb1) * (0.5 * (double)feedbackLevel[i]));
+                }
+                else if constexpr (FB == FB_NEGATIVE)
+                {
+                    // 1 - (1 - fb) is exactly fb unless fb is too small to move the phase, and a
+                    // float squared fits a double, so this rounds the same exact product once
+                    auto s = (double)(fb0 + fb1);
+                    ph = phsL + phaseInput[i] +
+                         (int32_t)((s * s) * (0.25 * (double)feedbackLevel[i]));
+                }
+                else
+                {
+                    auto fb = 0.5 * (fb0 + fb1);
+                    auto sb = (feedbackLevel[i] < 0);
+                    // fb = sb ? fb * fb : fb. Ugh a branch. but bool = 0/1, so
+                    // (1-sb) * fb + sb * fb * fb - 3 mul, 2 add
+                    // fb - sb * fb + sb * fb * fb - 3 nul 2 add
+                    // fb * ( 1 - sb * ( 1 - fb)) - 2 mul 2 add
+                    fb = fb * (1 - sb * (1 - fb));
+                    ph = phsL + phaseInput[i] + (int32_t)(feedbackLevel[i] * fb);
+                }
+            }
+            else
+            {
+                ph = phsL + phaseInput[i];
+            }
 
-            auto ph = phs + phaseInput[i] + (int32_t)(feedbackLevel[i] * fb);
-            auto out = st.at(ph);
+            if constexpr (IsWT)
+            {
+                // setMorph early-outs on a single frame table, so the common case is one
+                // predictable compare rather than pointer work
+                wtReader.setMorph(nextMorph);
+                nextMorph += dMorph;
+            }
+
+            float out;
+            if constexpr (ET == EM::PHASE_REMAP)
+            {
+                using PM = Patch::SourceNode::PhaseMapShape;
+                if constexpr (S == PM::SAW)
+                    ph = remap::remapSaw(ph & phase::phaseMask, nextM);
+                else if constexpr (S == PM::SQUARE)
+                    ph = remap::remapSquare(ph & phase::phaseMask, nextM);
+                else if constexpr (S == PM::PULSE)
+                    ph = remap::remapPulse(ph & phase::phaseMask, nextM);
+                else if constexpr (S == PM::DOUBLE)
+                    ph = remap::remapDoubleSine(ph & phase::phaseMask, nextM);
+                else if constexpr (S == PM::SIN_TO_SQUARE)
+                    ph = remap::remapSinToSquare(ph & phase::phaseMask, nextM);
+                else if constexpr (S == PM::DOUBLE_SAW)
+                    ph = remap::remapDoubleSaw(ph & phase::phaseMask, nextM);
+                nextM += dM;
+                out = readTable<IsWT>(ph + phaseMapReadPhaseCachedAtAttack);
+            }
+            else if constexpr (ET == EM::RESONANT_SWEEP)
+            {
+                using RW = Patch::SourceNode::ResonantSweepWindow;
+                auto wph = ph & phase::phaseMask;
+                float window;
+                if constexpr (R == RW::TRIANGLE)
+                    window = resonant_window::windowTriangle(wph);
+                else if constexpr (R == RW::TRAPEZOID)
+                    window = resonant_window::windowTrapezoid(wph);
+                else if constexpr (R == RW::FULLTRAP)
+                    window = resonant_window::windowFullTrapezoid(wph);
+                else if constexpr (R == RW::HANN || R == RW::BLACKMAN_HARRIS || R == RW::TUKEY)
+                    window = stWindow.at(wph);
+                else // RW::SAW and any unhandled future value — keep `window` defined.
+                    window = resonant_window::windowSaw(wph);
+                // Inner phase runs at k(m)x the fundamental and natural-wraps at the
+                // fundamental boundary via uint32 multiplication (mod phaseMax).
+                // kScale is the patch-selected sweep depth (2 / 4 / 10).
+                auto kFactor = std::max(kScale * nextM + 1.0f, 0.f);
+                uint32_t kmph = static_cast<uint32_t>(static_cast<float>(wph) * kFactor);
+                nextM += dM;
+                out = window * readTable<IsWT>(kmph);
+            }
+            else if constexpr (ET == EM::NOISE)
+            {
+                if (noisePos >= 16)
+                {
+                    noiseHelper.fill16(noiseBuf, noiseType, nextN, baseFrequency, lfsrMode,
+                                       monoValues.noiseBandLimitHz);
+                    noisePos = 0;
+                }
+                float noise = noiseBuf[noisePos++];
+                float m = nextM;
+                nextM += dM;
+                if constexpr (NM == NMode::ADD_TO_PHASE)
+                {
+                    ph += static_cast<int32_t>(m * noise * phase::phaseMaxF *
+                                               Patch::SourceNode::noisePhaseScale);
+                    out = readTable<IsWT>(ph);
+                }
+                else if constexpr (NM == NMode::ADD_TO_SIGNAL)
+                {
+                    out = readTable<IsWT>(ph) + m * noise;
+                }
+                else if constexpr (NM == NMode::MUL_BY_SIGNAL)
+                {
+                    out = readTable<IsWT>(ph) * (1.f + m * noise);
+                }
+                else if constexpr (NM == NMode::MUL_BY_UNI_SIGNAL)
+                {
+                    auto u = (readTable<IsWT>(ph) + 1.f) * 0.5f;
+                    out = u * (1.f + m * noise) * 2.f - 1.f;
+                }
+                else // MIX_WITH_SIGNAL
+                {
+                    auto base = readTable<IsWT>(ph);
+                    out = (1.f - m) * base + m * noise;
+                }
+            }
+            else
+            {
+                out = readTable<IsWT>(ph);
+            }
 
             out = out * rmLevel[i];
             onto[i] = out;
-            fbv[1] = fbv[0];
-            fbv[0] = out;
+            if constexpr (FB != FB_OFF)
+            {
+                fb1 = fb0;
+                fb0 = out;
+            }
+        }
+        phs = phsL;
+        dPhase = dPhaseL;
+        if constexpr (FB != FB_OFF)
+        {
+            fbv[0] = fb0;
+            fbv[1] = fb1;
+        }
+        else
+        {
+            // keep the history the fb path would have, so feedback returning next block is exact
+            fbv[1] = onto[blockSize - 2];
+            fbv[0] = onto[blockSize - 1];
         }
     }
 
@@ -311,15 +858,19 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
         lfoRatioAtten = 1.f;
         ratioMod = 0.f;
         phaseMod = 0.f;
+        extendedMMod = 0.f;
+        extendedNMod = 0.f;
+        morphMod = 0.f;
     }
     void calculateModulation()
     {
+        // attack left these reset, and nothing but a source changes them
+        if (!anySources)
+            return;
+
         resetModulation();
         envResetMod();
         lfoResetMod();
-
-        if (!anySources)
-            return;
 
         for (int i = 0; i < numModsPer; ++i)
         {
@@ -355,6 +906,15 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
                     case Patch::SourceNode::LFO_DEPTH_ATTEN:
                         lfoRatioAtten *= 1.0 - d * (1.0 - std::clamp(*sourcePointers[i], 0.f, 1.f));
                         break;
+                    case Patch::SourceNode::MORPH:
+                        morphMod += d * *sourcePointers[i];
+                        break;
+                    case Patch::SourceNode::EXTEND_M:
+                        extendedMMod += d * *sourcePointers[i];
+                        break;
+                    case Patch::SourceNode::EXTEND_N:
+                        extendedNMod += d * *sourcePointers[i];
+                        break;
                     default:
                         break;
                     }
@@ -364,7 +924,70 @@ struct alignas(16) OpSource : public EnvelopeSupport<Patch::SourceNode>,
     }
 
     SinTable st;
+    // Used by RESONANT_SWEEP for table-based windows (Hann / Blackman-Harris / Tukey).
+    // Independent of `st` so the operator's main waveform stays selectable freely. Always a
+    // static waveform: only the operator's own waveform can become a wavetable.
+    SinTable stWindow;
+
+    // Latched for the life of the note. Copying the shared_ptr is one atomic increment, and
+    // the store keeps its own reference, so nothing is ever freed from here.
+    std::shared_ptr<const Wavetable> heldTable;
+    WavetableReader wtReader;
+
+    /*
+     * Point the operator at its table, or fall back. A patch can name USER_TABLE with its
+     * blob missing or unparseable, and simdFullQuad has no entry for USER_TABLE - reading it
+     * would give silence - so an unresolved wavetable becomes a plain sine.
+     */
+    void bindWavetable()
+    {
+        if (usesWavetableCachedAtAttack)
+        {
+            // Copy, not read-through: the copy IS the latch. A sounding note keeps rendering
+            // the table it started on while the main thread swaps a new one into the node.
+            heldTable = sourceNode.wavetable;
+            if (heldTable)
+            {
+                wtReader.setTable(heldTable.get());
+            }
+            if (heldTable && wtReader.valid())
+            {
+                // latched with everything else; a mid-note change waits for the next attack
+                wtReader.setZeroOrderHold(
+                    static_cast<WavetableBandLimit>(
+                        (uint32_t)std::round(sourceNode.wavetableBandLimit.value)) ==
+                    WavetableBandLimit::DIRECT_ZOH);
+                wtReader.setMorph(0.f);
+                st.setWaveForm(SinTable::SIN); // unread, but keep it pointed somewhere sane
+                return;
+            }
+            // no table, or one the reader will not accept: sound as a sine rather than
+            // reading through a pointer setTable declined to set
+            heldTable.reset();
+            usesWavetableCachedAtAttack = false;
+            st.setWaveForm(SinTable::SIN);
+            return;
+        }
+        heldTable.reset();
+        st.setWaveForm(waveFormCachedAtAttack, legacyDspCachedAtAttack);
+    }
+
+    // The table read, resolved at compile time. A runtime ternary here does not survive
+    // MSVC on x86, which is why IsWT is a template parameter all the way down.
+    template <bool IsWT> inline float readTable(uint32_t ph) const
+    {
+        if constexpr (IsWT)
+            return wtReader.at(ph);
+        else
+            return st.at(ph);
+    }
     float fbVal[2]{0.f, 0.f};
+
+    // 16-sample noise buffer drained across two blocks (blockSize = 8). NoiseHelper
+    // is seeded once at construction; not re-seeded on note retrigger.
+    NoiseHelper noiseHelper;
+    float noiseBuf alignas(16)[16]{};
+    int noisePos{16};
 };
 } // namespace baconpaul::six_sines
 
